@@ -32,8 +32,31 @@ stores into ``create_app``):
    ``<data_dir>/config.yaml``)::
 
        sandbox:
-         provider: modal          # lakebox|modal|daytona|boxlite|cwsandbox|islo|e2b|openshell
+         # lakebox|modal|daytona|blaxel|boxlite|cwsandbox|islo|e2b|openshell|kubernetes
+         provider: modal
          server_url: https://omnigent.example.com
+         # For SEVERAL providers, replace `provider:` with a `providers:`
+         # list (mutually exclusive); a create picks one by name via
+         # `sandbox_provider`, else the first. See parse_sandbox_config.
+         host_config:             # optional; provider-agnostic. Verbatim
+                                  # in-sandbox ~/.omnigent/config.yaml content,
+                                  # installed before `omnigent host` starts
+                                  # (e.g. route the `pi` harness through a
+                                  # self-hosted gateway). Server-managed:
+                                  # entries injected earlier are replaced or
+                                  # removed on the next launch/resume; user
+                                  # config in the sandbox survives. Keep
+                                  # secrets out via api_key_ref: env: —
+                                  # resolved in the SANDBOX env (harness
+                                  # Secret / provider env lane).
+           providers:
+             litellm:
+               kind: gateway
+               default: [pi]
+               openai:
+                 base_url: http://litellm.litellm.svc.cluster.local/v1
+                 api_key_ref: env:LITELLM_API_KEY
+                 wire_api: chat
          modal:                   # optional block
            image: docker.io/me/omnigent-host:latest  # default: official image
            secrets: [omnigent-llm]  # Modal secrets injected as sandbox env
@@ -41,6 +64,7 @@ stores into ``create_app``):
          boxlite:                 # optional block (provider: boxlite)
            image: docker.io/me/omnigent-host:latest    # shared; default: official
            env: [OPENAI_API_KEY, GIT_TOKEN]            # shared; SERVER env var NAMES
+           disk_size_gb: 100                           # shared; default: SDK default
            # exactly one mode (mutually exclusive):
            cloud: {endpoint: https://boxlite.example.com:8100}  # CLOUD; key: BOXLITE_API_KEY env
            # local: {home_dir: /data/boxlite, registry: {...}}  # LOCAL (default if omitted)
@@ -49,6 +73,12 @@ stores into ``create_app``):
            env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES whose
                                              # values are injected as
                                              # sandbox env
+         blaxel:                  # optional block (provider: blaxel)
+           image: blaxel/omnigent-host:TAG  # optional fixed tag override
+           env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES
+           region: us-was-1       # optional
+           memory_mb: 4096        # optional; default: 4096
+           ttl: 24h               # optional; default maximum age: 24h
          islo:                    # optional block (provider: islo)
            image: docker.io/me/omnigent-host:latest  # default: official image
            env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES injected
@@ -67,21 +97,26 @@ stores into ``create_app``):
                                              # as sandbox env
            cluster: my-gateway              # optional OpenShell gateway name
 
-   The image defaults to the official prebaked host image
-   (``ghcr.io/omnigent-ai/omnigent-host:latest``; see
-   :data:`omnigent.onboarding.sandboxes.base.DEFAULT_HOST_IMAGE` and
-   the per-provider env overrides), so ``provider`` + ``server_url``
-   is a complete config. Provider credentials are NOT in this file
+   Most providers default to a public prebaked host image, so
+   ``provider`` + ``server_url`` is a complete config. Registry-backed
+   providers use ``ghcr.io/omnigent-ai/omnigent-host:latest`` (see
+   :data:`omnigent.onboarding.sandboxes.base.DEFAULT_HOST_IMAGE`); Blaxel uses
+   ``blaxel/omnigent-host:latest``, which adds its required ``sandbox-api``.
+   Both defaults remain overridable. Use a private immutable Blaxel image when
+   a production rollout must stay on fixed image contents.
+   Provider credentials are NOT in this file
    (12-factor): the Modal launcher reads ``MODAL_TOKEN_ID`` /
    ``MODAL_TOKEN_SECRET`` (or ``~/.modal.toml``) and the Daytona
    launcher reads ``DAYTONA_API_KEY`` (plus optional
    ``DAYTONA_API_URL`` / ``DAYTONA_TARGET``), and the Islo launcher
    reads ``ISLO_API_KEY`` (plus optional ``ISLO_BASE_URL``) from the
-   server process environment. The OpenShell launcher needs no API key:
+   server process environment. The Blaxel launcher reads ``BL_WORKSPACE``
+   and ``BL_API_KEY`` or the local ``bl login`` profile. The OpenShell
+   launcher needs no API key:
    it connects to the gateway made active with ``openshell gateway
    select`` (``$OPENSHELL_GATEWAY`` / ``~/.config/openshell/active_gateway``,
    or ``sandbox.openshell.cluster``), so the server process needs
-   OpenShell gateway access. ``modal``, ``daytona``, ``cwsandbox``,
+   OpenShell gateway access. ``modal``, ``daytona``, ``blaxel``, ``cwsandbox``,
    ``islo``, and ``openshell`` have managed-launch support; ``lakebox``
    parses but rejects at launch.
 
@@ -104,23 +139,26 @@ stores into ``create_app``):
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
+import posixpath
 import re
 import secrets
 import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import click
 from fastapi import HTTPException
 
-from omnigent.db.utils import now_epoch
+from omnigent.db.utils import builtin_agent_id, now_epoch
 from omnigent.stores.host_store import Host, HostStore
 
 if TYPE_CHECKING:
-    from omnigent.onboarding.sandboxes import SandboxLauncher
+    from omnigent.onboarding.sandboxes import SandboxHostLauncher
+    from omnigent.stores.agent_store import AgentStore
 
 _logger = logging.getLogger(__name__)
 
@@ -135,16 +173,29 @@ SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
         "lakebox",
         "modal",
         "daytona",
+        "blaxel",
         "boxlite",
         "cwsandbox",
         "islo",
         "e2b",
         "openshell",
         "kubernetes",
+        "tenki",
     }
 )
 PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
-    {"modal", "daytona", "boxlite", "cwsandbox", "islo", "e2b", "openshell", "kubernetes"}
+    {
+        "modal",
+        "daytona",
+        "blaxel",
+        "boxlite",
+        "cwsandbox",
+        "islo",
+        "e2b",
+        "openshell",
+        "kubernetes",
+        "tenki",
+    }
 )
 
 # How long a managed launch waits for the sandboxed host to register
@@ -171,6 +222,12 @@ MODAL_MANAGED_TOKEN_TTL_S = 25 * 3600
 # session past 7 days going through the dead-host relaunch path) mints
 # a fresh token.
 DAYTONA_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
+
+# The blaxel launch-token TTL is NOT a constant: Blaxel reaps a sandbox at its
+# configured max age (sandbox.blaxel.ttl, 24h by default), so the TTL is derived
+# from that age at parse time via blaxel.managed_token_ttl_s(). It always sits
+# above the age, so a live sandbox can re-authenticate its tunnel across
+# reconnects while a token leaked from a reaped sandbox cannot.
 
 # Launch-token lifetime for the YAML boxlite path. Boxlite boxes have no
 # platform lifetime cap and persist across restarts, so the bound is policy,
@@ -199,6 +256,14 @@ OPENSHELL_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 # mints a fresh token (and the per-Pod token Secret is replaced).
 KUBERNETES_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 
+# Launch-token lifetime for the YAML tenki path. Omnigent does not set a
+# session max_duration, so Tenki sandboxes have no forced lifetime cap
+# (they run until managed-session teardown terminates them); the bound is
+# policy, not platform: the same 7-day window as Daytona/Islo keeps a
+# long-lived host re-authenticating across tunnel reconnects while still
+# expiring tokens of sandboxes nobody deleted. A relaunch mints a fresh token.
+TENKI_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
+
 # The cwsandbox launch-token TTL is NOT a constant: CW Sandbox's lifetime is
 # operator-overridable (OMNIGENT_CWSANDBOX_MAX_LIFETIME_S), so the TTL is
 # derived from the resolved lifetime at parse time via
@@ -222,12 +287,87 @@ _HOST_LOG_PATH = "/tmp/omnigent-host.log"
 # genuinely slow launch.
 MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S = MANAGED_HOST_ONLINE_TIMEOUT_S + 120
 
+# Server-internal sandbox lifecycle labels — currently the repository a relaunch
+# re-clones. A client seed would forge that reconstruction, so session
+# create/patch reject any client label here, closing future keys by default.
+MANAGED_SANDBOX_LABEL_NAMESPACE = "omnigent.sandbox."
+
 # Session label recording the repository-URL workspace a managed
 # session was created with (the raw ``<url>[#<branch>]`` request
 # value). ``conversations.workspace`` is overwritten with the CLONED
 # path at bind time, so this label is what a sandbox RELAUNCH parses
 # to re-clone the repository into the fresh generation's workspace.
 MANAGED_REPO_LABEL_KEY = "omnigent.sandbox.repo"
+
+
+def resolve_managed_agent_label(
+    agent_store: AgentStore,
+    agent_id: str | None,
+    *,
+    session_id: str,
+) -> str | None:
+    """
+    Resolve the agent-classifier value for a managed runner Pod, gated to
+    genuine built-ins.
+
+    The runner Pod's ``omnigent.ai/agent`` label is what an admission policy
+    selects on to inject a privileged credential (e.g. a scoped git token).
+    That is only trustworthy for a genuine BUILT-IN (operator-seeded) agent:
+    a user can create a *session-scoped* agent whose name matches a built-in's,
+    so name alone is spoofable. The gate is ``session_id is None AND id ==
+    builtin_agent_id(name)`` — the same identity built-in seeding uses. A
+    session-scoped or user-uploaded agent (random id, and/or an owning
+    conversation) fails it and its runner gets NO agent label.
+
+    The label is an optimization, never a launch precondition: any failure to
+    resolve (no agent, unknown id, not a built-in, or a store error) returns
+    ``None`` so the caller omits the label rather than stamping something
+    unmatchable or failing the create. The decision is logged either way (the
+    "why did this runner get no credential" line).
+
+    :param agent_store: Store to resolve the agent record from.
+    :param agent_id: The session's bound agent id, or ``None``.
+    :param session_id: Session id, for log correlation only.
+    :returns: The built-in agent's registered name to stamp, or ``None`` to
+        omit the classifier.
+    """
+    if agent_id is None:
+        _logger.info("session %s: no agent label (session has no bound agent)", session_id)
+        return None
+    try:
+        agent = agent_store.get(agent_id)
+    except Exception:  # noqa: BLE001 — the label is an optimization, never a
+        # create precondition. Any store failure degrades to an unlabeled runner
+        # (the admission policy skips it) rather than 500-ing a create that has
+        # already committed and announced the session.
+        _logger.warning(
+            "session %s: agent-label resolve failed for agent %s; omitting label",
+            session_id,
+            agent_id,
+            exc_info=True,
+        )
+        return None
+    if agent is None:
+        _logger.warning(
+            "session %s: agent id %s did not resolve to an agent; omitting label",
+            session_id,
+            agent_id,
+        )
+        return None
+    if agent.session_id is not None or agent.id != builtin_agent_id(agent.name):
+        _logger.info(
+            "session %s: agent %r (%s) is not a genuine built-in; omitting agent label",
+            session_id,
+            agent.name,
+            agent.id,
+        )
+        return None
+    _logger.info(
+        "session %s: classifying runner with built-in agent label %r",
+        session_id,
+        agent.name,
+    )
+    return agent.name
 
 
 @dataclass
@@ -367,13 +507,145 @@ class ManagedSandboxConfig:
         falls back to the generic "New Sandbox" label. Exposed (when
         managed launch is supported) on the unauthenticated
         ``GET /v1/info`` as ``sandbox_provider``.
+    :param host_config: Verbatim in-sandbox ``~/.omnigent/config.yaml``
+        content (e.g. a ``providers:`` block routing a harness through
+        a self-hosted gateway) installed into the sandbox's config before
+        ``omnigent host`` starts, or ``None``. Server-managed: previously
+        injected entries are replaced or removed on each launch/resume so
+        the sandbox always reflects the current block. Provider-agnostic:
+        forwarded to every launcher's ``start_host`` — see
+        :func:`omnigent.onboarding.sandboxes.base.render_host_config_write_command`.
+        Non-secret by design: credentials stay behind
+        ``api_key_ref: env:VAR`` indirection, resolved inside the
+        sandbox against its own environment.
     """
 
     server_url: str
-    launcher_factory: Callable[[], SandboxLauncher]
+    launcher_factory: Callable[[], SandboxHostLauncher]
     token_ttl_s: int
     managed_launch_supported: bool = True
     provider: str | None = None
+    host_config: dict[str, object] | None = None
+
+
+@dataclass
+class ManagedSandboxDeployment:
+    """
+    The set of sandbox providers a server offers, as a single unit.
+
+    Wraps one :class:`ManagedSandboxConfig` per provider. A
+    single-provider deployment holds exactly one; a ``sandbox.providers``
+    list holds several. Callers thread this — not a bare
+    :class:`ManagedSandboxConfig` — through the managed-host lifecycle
+    and resolve the per-provider config through :meth:`for_provider` /
+    :meth:`recorded`, so they never branch on which config shape the
+    deployment was built from.
+
+    Built by :func:`parse_sandbox_config` from the server YAML, or by
+    :meth:`single` around a directly-constructed embedding config.
+
+    :param configs: One single-provider config per offered provider, in
+        configured order. Never empty. The first is the deployment
+        default a request that names no provider gets.
+    """
+
+    configs: tuple[ManagedSandboxConfig, ...]
+
+    def __post_init__(self) -> None:
+        # Enforce the "never empty" invariant the accessors rely on
+        # (:attr:`default` indexes ``configs[0]``): the parser already
+        # rejects an empty ``providers`` list, so a breach means a
+        # direct constructor passed ``configs=()``.
+        if not self.configs:
+            raise ValueError("ManagedSandboxDeployment requires at least one provider config")
+
+    @classmethod
+    def single(cls, config: ManagedSandboxConfig) -> ManagedSandboxDeployment:
+        """
+        Wrap one provider config as a one-provider deployment.
+
+        The path an embedding deployment's directly-constructed config
+        takes: ``create_app`` wraps it so the rest of the flow sees a
+        deployment uniformly.
+
+        :param config: The single provider's config.
+        :returns: A deployment offering exactly *config*.
+        """
+        return cls(configs=(config,))
+
+    @property
+    def default(self) -> ManagedSandboxConfig:
+        """
+        The provider a request that names none launches on.
+
+        Prefers the first launch-capable provider, so the default
+        launcher and the :attr:`managed_launch_supported` flag agree
+        even when a staged provider (e.g. ``lakebox``) is listed first.
+        Falls back to the first entry when none supports launch, so a
+        deployment of only staged providers still resolves.
+
+        :returns: The default single-provider config.
+        """
+        for config in self.configs:
+            if config.managed_launch_supported:
+                return config
+        return self.configs[0]
+
+    @property
+    def managed_launch_supported(self) -> bool:
+        """Whether ANY offered provider can serve a managed launch."""
+        return any(config.managed_launch_supported for config in self.configs)
+
+    def offered(self) -> tuple[ManagedSandboxConfig, ...]:
+        """Every provider config this deployment offers, in configured order."""
+        return self.configs
+
+    def for_provider(self, provider: str | None) -> ManagedSandboxConfig | None:
+        """
+        Resolve the config backing one provider name.
+
+        :param provider: Provider short name, e.g. ``"modal"``. ``None``
+            selects the deployment :attr:`default`, which is what a
+            request that names no provider gets.
+        :returns: The matching single-provider config, or ``None`` when
+            this deployment does not offer *provider*.
+        """
+        if provider is None:
+            return self.default
+        for config in self.configs:
+            if config.provider == provider:
+                return config
+        return None
+
+    def recorded(self, provider: str | None) -> ManagedSandboxConfig:
+        """
+        Resolve the config to act on a host launched with *provider*.
+
+        Never fails, unlike :meth:`for_provider`: falls back to the
+        :attr:`default` when the recorded provider is no longer offered,
+        so the caller (which compares the built launcher's provider
+        against the host row) still gets a config to try.
+
+        :param provider: Provider recorded on the host row, or ``None``.
+        :returns: The config whose launcher should act on that host.
+        """
+        return self.for_provider(provider) or self.default
+
+    def launchable_providers(self) -> tuple[str, ...]:
+        """
+        Names of every offered provider that can actually serve a launch.
+
+        Excludes staged providers (parse-but-reject, e.g. ``lakebox``) and
+        configs naming no provider, so this is exactly what a client may
+        choose from.
+
+        :returns: Provider short names, in configured order.
+        """
+        return tuple(
+            config.provider
+            for config in self.configs
+            if config.managed_launch_supported and config.provider is not None
+        )
 
 
 @dataclass
@@ -552,7 +824,7 @@ def parse_repo_workspace(workspace: str) -> RepoWorkspace:
 def _modal_launcher_factory(
     image: str | None,
     secrets: list[str] | None,
-) -> Callable[[], SandboxLauncher]:
+) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: modal`` path.
 
@@ -567,7 +839,7 @@ def _modal_launcher_factory(
     :returns: A factory producing parameterized Modal launchers.
     """
 
-    def _build() -> SandboxLauncher:
+    def _build() -> SandboxHostLauncher:
         """Construct the Modal launcher (lazy SDK import inside)."""
         from omnigent.onboarding.sandboxes.modal import ModalSandboxLauncher
 
@@ -576,7 +848,94 @@ def _modal_launcher_factory(
     return _build
 
 
-def _unsupported_launcher_factory(provider: str) -> Callable[[], SandboxLauncher]:
+def _community_sandbox_providers() -> frozenset[str]:
+    """Provider names contributed by packages, excluding every built-in.
+
+    The registry merges built-ins and entry-point contributions into one map,
+    so the difference against :data:`SUPPORTED_SANDBOX_PROVIDERS` is what
+    isolates the contributed ones. Taking the difference rather than reaching
+    for the registry's private built-in contribution keeps this to the
+    registry's public API.
+
+    Never raises: the registry records a broken plugin and carries on, and a
+    server that refuses to start because somebody's optional package is
+    malformed would be a worse failure than a provider that is simply absent.
+
+    :returns: Contributed provider names, empty when none are installed.
+    """
+    from omnigent.onboarding.sandboxes import registry as sandbox_registry
+
+    return frozenset(sandbox_registry.available_providers()) - SUPPORTED_SANDBOX_PROVIDERS
+
+
+def _registry_token_ttl_s(provider: str) -> int:
+    """The contributed provider's declared managed-token TTL, or the default.
+
+    :param provider: A contributed provider name.
+    :returns: Its ``managed_token_ttl_s``, falling back to the conservative
+        Modal TTL when it declares none.
+    """
+    from omnigent.onboarding.sandboxes import registry as sandbox_registry
+
+    meta = sandbox_registry.get_provider_metadata(provider)
+    ttl = meta.managed_token_ttl_s if meta is not None else None
+    return ttl if ttl is not None else MODAL_MANAGED_TOKEN_TTL_S
+
+
+def _parse_registry_config(provider: str, section: dict[str, object] | None) -> None:
+    """Validate a community provider's config block at parse time.
+
+    Mirrors the built-ins: operator typos in ``sandbox.<provider>`` stop
+    server startup rather than surfacing as a runtime error on the first
+    managed session.
+
+    :param provider: A contributed provider name.
+    :param section: The ``sandbox.<provider>`` mapping, or ``None`` when
+        the block is absent (accepted when no ``config_model`` is declared).
+    :raises ValueError: When the block fails validation against the
+        provider's declared ``config_model``.
+    """
+    from omnigent.onboarding.sandboxes import registry as sandbox_registry
+
+    meta = sandbox_registry.get_provider_metadata(provider)
+    if meta is None or meta.config_model is None:
+        return
+    try:
+        meta.config_model(**dict(section or {}))
+    except Exception as exc:
+        raise ValueError(
+            f"server config 'sandbox.{provider}' is invalid for provider '{provider}': {exc}"
+        ) from exc
+
+
+def _registry_launcher_factory(
+    provider: str, config: dict[str, object] | None
+) -> Callable[[], SandboxHostLauncher]:
+    """Build the launcher factory for a contributed provider.
+
+    Construction is deferred into the returned callable for the same reason
+    every built-in factory defers it: the launcher's SDK import happens in its
+    constructor, and a server whose config names a provider should still start
+    when that provider's optional dependency is missing. The failure then
+    surfaces on the launch that needs it, naming the provider.
+
+    :param provider: A contributed provider name.
+    :param config: The provider's ``sandbox.<provider>`` block (already
+        validated against ``config_model`` at parse time), or ``None`` when
+        the block is absent.
+    :returns: A factory producing that provider's launcher.
+    """
+
+    def _build() -> SandboxHostLauncher:
+        """Construct the contributed launcher (lazy import inside)."""
+        from omnigent.onboarding.sandboxes import registry as sandbox_registry
+
+        return sandbox_registry.instantiate(provider, config=config)
+
+    return _build
+
+
+def _unsupported_launcher_factory(provider: str) -> Callable[[], SandboxHostLauncher]:
     """
     Build a factory that rejects launch for a not-yet-supported provider.
 
@@ -588,7 +947,7 @@ def _unsupported_launcher_factory(provider: str) -> Callable[[], SandboxLauncher
     :returns: A factory that raises ``HTTPException`` 400 when called.
     """
 
-    def _reject() -> SandboxLauncher:
+    def _reject() -> SandboxHostLauncher:
         """Reject the launch with the provider named."""
         raise HTTPException(
             status_code=400,
@@ -602,18 +961,116 @@ def _unsupported_launcher_factory(provider: str) -> Callable[[], SandboxLauncher
     return _reject
 
 
-def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
+def _parse_host_config(raw: dict[str, object]) -> dict[str, object] | None:
+    """
+    Extract and validate the top-level ``sandbox.host_config`` block.
+
+    Verbatim in-sandbox ``~/.omnigent/config.yaml`` content forwarded at
+    managed launch (see :class:`ManagedSandboxConfig`). When a
+    ``providers`` key is present, its SHAPE is validated through the same
+    parser ``omnigent`` itself uses — structurally only: secret
+    references (``api_key_ref: env:VAR``) name variables in the
+    SANDBOX's environment, not the server's, so they are deliberately
+    never resolved here. Validating at parse time matters doubly for
+    this block: inside the sandbox a malformed ``providers`` entry
+    degrades silently (the harness falls back to its own login), so
+    server startup is the only place a typo can fail loud.
+
+    :param raw: The raw ``sandbox`` mapping.
+    :returns: The validated ``host_config`` mapping, or ``None`` when
+        the key is absent.
+    :raises ValueError: When present but not a mapping, or when its
+        ``providers`` block fails shape validation.
+    """
+    host_config = raw.get("host_config")
+    if host_config is None:
+        return None
+    if not isinstance(host_config, dict):
+        raise ValueError(
+            "server config 'sandbox.host_config' must be a mapping — verbatim "
+            "in-sandbox ~/.omnigent/config.yaml content merged in before "
+            "'omnigent host' starts"
+        )
+    # Key presence, not get(): an explicit `providers: null` would skip
+    # validation here yet still ride to the sandbox, where the merge writes
+    # `providers: null` over any existing block — the silent degradation this
+    # parse exists to prevent.
+    if "providers" in host_config:
+        providers = host_config["providers"]
+        # load_providers silently ignores a non-mapping providers value, so
+        # the mapping check must happen here to fail loud.
+        if not isinstance(providers, dict):
+            raise ValueError("server config 'sandbox.host_config.providers' must be a mapping")
+        # Lazy imports, matching the provider branches below: the parse path
+        # must not pull the onboarding layer in at module import time.
+        from omnigent.errors import OmnigentError
+        from omnigent.onboarding.provider_config import get_default_provider, load_providers
+
+        try:
+            parsed_providers = load_providers(host_config)
+            default_scopes = {
+                scope
+                for provider in parsed_providers.values()
+                for scope in provider.default_families
+            }
+            for scope in sorted(default_scopes):
+                get_default_provider(host_config, scope)
+        except OmnigentError as exc:
+            raise ValueError(
+                f"server config 'sandbox.host_config.providers' is invalid: {exc}"
+            ) from exc
+        for provider in parsed_providers.values():
+            for family_name, family in provider.families.items():
+                if family.api_key is not None:
+                    raise ValueError(
+                        "server config "
+                        f"'sandbox.host_config.providers.{provider.name}."
+                        f"{family_name}.api_key' must not contain an inline API key — "
+                        "use api_key_ref: env:VAR instead"
+                    )
+    # The block rides json.dumps to the sandbox on every launch, and
+    # yaml.safe_load produces values json can't take (an unquoted date
+    # becomes datetime.date) — round-trip now so that fails startup, not
+    # every launch.
+    import json
+
+    try:
+        serialized = json.dumps(host_config)
+        round_tripped = json.loads(serialized)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"server config 'sandbox.host_config' must be JSON-serializable "
+            f"(quote YAML scalars like dates): {exc}"
+        ) from exc
+    if round_tripped != host_config:
+        raise ValueError(
+            "server config 'sandbox.host_config' must be JSON-serializable without loss "
+            "(mapping keys must be strings and values must preserve their JSON types)"
+        )
+    return host_config
+
+
+def parse_sandbox_config(raw: object) -> ManagedSandboxDeployment | None:
     """
     Parse and validate the server config's ``sandbox:`` section.
 
     Fails loud on malformed config (an operator typo should stop server
     startup, not surface as a runtime 502 on the first managed session).
 
-    :param raw: The raw ``sandbox`` value from the server config YAML,
-        e.g. ``{"provider": "modal", "server_url": "https://…",
-        "modal": {"image": "docker.io/me/omnigent-host:latest"}}``.
+    Takes either a scalar ``provider:`` (one provider) or a ``providers:``
+    list (several, offered side by side), never both. ``server_url`` /
+    ``host_config`` stay top-level and apply to every entry::
+
+        sandbox:
+          server_url: https://omnigent.example.com
+          providers:
+            - provider: modal
+              modal: {image: docker.io/me/omnigent-host:latest}
+            - provider: e2b
+
+    :param raw: The raw ``sandbox`` value from the server config YAML.
         ``None`` when the section is absent.
-    :returns: The parsed config, or ``None`` when *raw* is ``None``
+    :returns: The parsed deployment, or ``None`` when *raw* is ``None``
         (managed hosts not configured).
     :raises ValueError: When the section is present but malformed.
     """
@@ -621,9 +1078,73 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
         return None
     if not isinstance(raw, dict):
         raise ValueError("server config 'sandbox' must be a mapping")
+    if "providers" in raw:
+        return _parse_multi_provider_sandbox_config(raw)
+    return ManagedSandboxDeployment.single(_parse_single_provider_sandbox_config(raw))
+
+
+def _parse_multi_provider_sandbox_config(raw: dict[str, object]) -> ManagedSandboxDeployment:
+    """
+    Parse the ``sandbox.providers`` list shape into a deployment.
+
+    Entries go through the single-provider parser with the shared
+    top-level keys folded in, so a provider block validates identically
+    in either shape.
+
+    :param raw: The raw ``sandbox`` mapping, containing ``providers``.
+    :returns: A deployment holding one config per listed provider.
+    :raises ValueError: When the list or any entry is malformed.
+    """
+    if "provider" in raw:
+        raise ValueError(
+            "server config 'sandbox' must set either 'provider' (one provider) "
+            "or 'providers' (several), not both"
+        )
+    entries = raw.get("providers")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError(
+            "server config 'sandbox.providers' must be a non-empty list of "
+            "provider mappings, e.g. [{provider: modal}, {provider: e2b}]"
+        )
+    # Shared keys describe THIS server, so they ride into every entry
+    # instead of being repeated per entry.
+    shared = {key: value for key, value in raw.items() if key not in {"providers", "provider"}}
+    parsed: list[ManagedSandboxConfig] = []
+    seen: set[str] = set()
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"server config 'sandbox.providers[{index}]' must be a mapping "
+                "naming a provider, e.g. {provider: modal}"
+            )
+        if "providers" in entry:
+            raise ValueError(
+                f"server config 'sandbox.providers[{index}]' must not nest 'providers'"
+            )
+        config = _parse_single_provider_sandbox_config({**shared, **entry})
+        # Always a str: the single-provider parser rejects anything else.
+        name = str(config.provider)
+        if name in seen:
+            raise ValueError(f"server config 'sandbox.providers' lists {name!r} more than once")
+        seen.add(name)
+        parsed.append(config)
+    return ManagedSandboxDeployment(configs=tuple(parsed))
+
+
+def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSandboxConfig:
+    """
+    Parse one provider's ``sandbox`` mapping (the scalar ``provider:`` shape).
+
+    :param raw: The raw ``sandbox`` mapping, with a scalar ``provider``.
+    :returns: The parsed single-provider config.
+    :raises ValueError: When the mapping is malformed.
+    """
     provider = raw.get("provider")
-    if provider not in SUPPORTED_SANDBOX_PROVIDERS:
-        supported = ", ".join(sorted(SUPPORTED_SANDBOX_PROVIDERS))
+    community = _community_sandbox_providers()
+    if not isinstance(provider, str) or (
+        provider not in SUPPORTED_SANDBOX_PROVIDERS and provider not in community
+    ):
+        supported = ", ".join(sorted(SUPPORTED_SANDBOX_PROVIDERS | community))
         raise ValueError(
             f"server config 'sandbox.provider' must be one of: {supported} (got {provider!r})"
         )
@@ -633,6 +1154,9 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             "server config 'sandbox.server_url' is required — the public URL "
             "of this server that sandboxed hosts connect back to"
         )
+    # Validated regardless of provider (like server_url): a malformed
+    # host_config should stop startup even for staged/unsupported providers.
+    host_config = _parse_host_config(raw)
     if provider == "modal":
         launcher_factory = _modal_launcher_factory(
             _parse_modal_image(raw), _parse_modal_secrets(raw)
@@ -643,10 +1167,34 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             _parse_daytona_image(raw), _parse_daytona_env(raw)
         )
         token_ttl_s = DAYTONA_MANAGED_TOKEN_TTL_S
+    elif provider == "blaxel":
+        from omnigent.onboarding.sandboxes.blaxel import managed_token_ttl_s
+
+        section = _parse_provider_section(raw, "blaxel")
+        if section is not None:
+            _reject_unknown_keys(
+                section,
+                {"image", "env", "region", "memory_mb", "ttl"},
+                "sandbox.blaxel",
+            )
+        blaxel_ttl = _parse_provider_string(raw, "blaxel", "ttl")
+        launcher_factory = _blaxel_launcher_factory(
+            image=_parse_blaxel_image(raw),
+            env=_parse_provider_env(raw, "blaxel"),
+            region=_parse_provider_string(raw, "blaxel", "region"),
+            memory_mb=_parse_provider_positive_int(raw, "blaxel", "memory_mb"),
+            ttl=blaxel_ttl,
+        )
+        # Derived from sandbox.blaxel.ttl so the token always outlives the
+        # sandbox age at which Blaxel reaps the host.
+        try:
+            token_ttl_s = managed_token_ttl_s(blaxel_ttl)
+        except ValueError as exc:
+            raise ValueError(f"server config 'sandbox.blaxel.ttl' is invalid: {exc}") from exc
     elif provider == "boxlite":
         section = _boxlite_section(raw)
-        _reject_unknown_boxlite_keys(
-            section, {"image", "env", "local", "cloud"}, "sandbox.boxlite"
+        _reject_unknown_keys(
+            section, {"image", "env", "local", "cloud", "disk_size_gb"}, "sandbox.boxlite"
         )
         endpoint, home_dir, registry = _parse_boxlite_mode(section)
         launcher_factory = _boxlite_launcher_factory(
@@ -655,6 +1203,7 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             _parse_boxlite_env(section),
             home_dir,
             registry,
+            _parse_provider_positive_int(raw, "boxlite", "disk_size_gb"),
         )
         token_ttl_s = BOXLITE_MANAGED_TOKEN_TTL_S
     elif provider == "cwsandbox":
@@ -695,9 +1244,34 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             image=_parse_provider_image(raw, "openshell"),
             env=_parse_provider_env(raw, "openshell"),
             cluster=_parse_provider_string(raw, "openshell", "cluster"),
+            workspace=_parse_provider_string(raw, "openshell", "workspace"),
         )
         token_ttl_s = OPENSHELL_MANAGED_TOKEN_TTL_S
     elif provider == "kubernetes":
+        kubernetes_section = _parse_provider_section(raw, "kubernetes")
+        if kubernetes_section is not None:
+            _reject_unknown_keys(
+                kubernetes_section,
+                {
+                    "image",
+                    "env",
+                    "namespace",
+                    "secret_name",
+                    "service_account",
+                    "node_selector",
+                    "kubeconfig",
+                    "in_cluster",
+                    "resources",
+                    "pvc_mounts",
+                    "secret_mounts",
+                    "pod_ready_timeout_s",
+                    "runtime_class",
+                },
+                "sandbox.kubernetes",
+            )
+        pvc_mounts = _parse_kubernetes_pvc_mounts(raw)
+        secret_mounts = _parse_kubernetes_secret_mounts(raw)
+        _reject_overlapping_kubernetes_mounts(pvc_mounts, secret_mounts)
         launcher_factory = _kubernetes_launcher_factory(
             image=_parse_provider_image(raw, "kubernetes"),
             env=_parse_provider_env(raw, "kubernetes"),
@@ -708,8 +1282,45 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             kubeconfig=_parse_provider_string(raw, "kubernetes", "kubeconfig"),
             in_cluster=_parse_provider_bool(raw, "kubernetes", "in_cluster"),
             resources=_parse_kubernetes_resources(raw),
+            pvc_mounts=pvc_mounts,
+            secret_mounts=secret_mounts,
+            pod_ready_timeout_s=_parse_provider_positive_int(
+                raw, "kubernetes", "pod_ready_timeout_s"
+            ),
+            runtime_class=_parse_provider_string(raw, "kubernetes", "runtime_class"),
         )
         token_ttl_s = KUBERNETES_MANAGED_TOKEN_TTL_S
+    elif provider == "tenki":
+        launcher_factory = _tenki_launcher_factory(
+            image=_parse_provider_image(raw, "tenki"),
+            env=_parse_provider_env(raw, "tenki"),
+            base_url=_parse_provider_string(raw, "tenki", "base_url"),
+            workspace=_parse_provider_string(raw, "tenki", "workspace"),
+            vcpus=_parse_tenki_bounded_int(raw, "vcpus", _TENKI_MIN_VCPUS, _TENKI_MAX_VCPUS),
+            memory_mb=_parse_tenki_bounded_int(
+                raw, "memory_mb", _TENKI_MIN_MEMORY_MB, _TENKI_MAX_MEMORY_MB, align2=True
+            ),
+            disk_gb=_parse_tenki_bounded_int(
+                raw, "disk_gb", _TENKI_MIN_DISK_GB, _TENKI_MAX_DISK_GB
+            ),
+        )
+        token_ttl_s = TENKI_MANAGED_TOKEN_TTL_S
+    elif provider in community:
+        # A provider contributed through the `omnigent.sandbox_providers`
+        # entry point group. The registry has validated it (name not shadowing
+        # a built-in, launcher class under `omnigent.community.sandbox.*`) at
+        # import time, so this only has to validate the config block and build
+        # the factory.
+        #
+        # Deliberately below every built-in branch and gated on `community`,
+        # which excludes anything in SUPPORTED_SANDBOX_PROVIDERS. Built-ins
+        # that are listed but have no branch — `lakebox` today — must keep
+        # falling through to the staged rejection below rather than silently
+        # gaining a launcher.
+        section = _parse_provider_section(raw, provider)
+        _parse_registry_config(provider, section)
+        launcher_factory = _registry_launcher_factory(provider, section)
+        token_ttl_s = _registry_token_ttl_s(provider)
     else:
         launcher_factory = _unsupported_launcher_factory(provider)
         # Never consulted (the factory rejects before any token is
@@ -719,8 +1330,11 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
         server_url=server_url.strip().rstrip("/"),
         launcher_factory=launcher_factory,
         token_ttl_s=token_ttl_s,
-        managed_launch_supported=provider in PROVIDERS_WITH_MANAGED_LAUNCH,
+        managed_launch_supported=(
+            provider in PROVIDERS_WITH_MANAGED_LAUNCH or provider in community
+        ),
         provider=provider,
+        host_config=host_config,
     )
 
 
@@ -799,7 +1413,7 @@ def _parse_modal_secrets(raw: dict[str, object]) -> list[str] | None:
 def _daytona_launcher_factory(
     image: str | None,
     env: list[str] | None,
-) -> Callable[[], SandboxLauncher]:
+) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: daytona`` path.
 
@@ -815,13 +1429,55 @@ def _daytona_launcher_factory(
     :returns: A factory producing parameterized Daytona launchers.
     """
 
-    def _build() -> SandboxLauncher:
+    def _build() -> SandboxHostLauncher:
         """Construct the Daytona launcher (lazy SDK import inside)."""
         from omnigent.onboarding.sandboxes.daytona import DaytonaSandboxLauncher
 
         return DaytonaSandboxLauncher(image=image, env=env)
 
     return _build
+
+
+def _blaxel_launcher_factory(
+    *,
+    image: str | None,
+    env: list[str] | None,
+    region: str | None,
+    memory_mb: int | None,
+    ttl: str | None,
+) -> Callable[[], SandboxHostLauncher]:
+    """Build the launcher factory for the YAML ``provider: blaxel`` path."""
+
+    def _build() -> SandboxHostLauncher:
+        """Construct the Blaxel launcher; the optional SDK remains lazy."""
+        from omnigent.onboarding.sandboxes.blaxel import BlaxelSandboxLauncher
+
+        return BlaxelSandboxLauncher(
+            image=image,
+            env=env,
+            region=region,
+            memory_mb=memory_mb,
+            ttl=ttl,
+        )
+
+    return _build
+
+
+def _parse_blaxel_image(raw: dict[str, object]) -> str | None:
+    """Extract an optional Blaxel image override for the public default."""
+    section = _parse_provider_section(raw, "blaxel")
+    if section is None:
+        return None
+    image = section.get("image")
+    if image is None:
+        return None
+    if not isinstance(image, str) or not image.strip():
+        raise ValueError(
+            "server config 'sandbox.blaxel.image' must be a non-empty Blaxel image id, "
+            "e.g. 'blaxel/omnigent-host:<tag>' (or omit it to use the "
+            "public image or OMNIGENT_BLAXEL_HOST_IMAGE override)"
+        )
+    return image.strip()
 
 
 def _parse_daytona_image(raw: dict[str, object]) -> str | None:
@@ -906,7 +1562,8 @@ def _boxlite_launcher_factory(
     env: list[str] | None,
     home_dir: str | None,
     registry: dict[str, object] | None,
-) -> Callable[[], SandboxLauncher]:
+    disk_size_gb: int | None,
+) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: boxlite`` path.
 
@@ -924,15 +1581,21 @@ def _boxlite_launcher_factory(
     :param registry: LOCAL-mode private-registry config for the host image
         (``host`` + optional ``transport`` / ``skip_verify`` / ``*_env``
         credential names), or ``None`` for anonymous pulls.
+    :param disk_size_gb: Box disk size in GB, or ``None`` for the SDK default.
     :returns: A factory producing parameterized boxlite launchers.
     """
 
-    def _build() -> SandboxLauncher:
+    def _build() -> SandboxHostLauncher:
         """Construct the boxlite launcher (lazy SDK import inside)."""
         from omnigent.onboarding.sandboxes.boxlite import BoxliteSandboxLauncher
 
         return BoxliteSandboxLauncher(
-            endpoint=endpoint, image=image, env=env, home_dir=home_dir, registry=registry
+            endpoint=endpoint,
+            image=image,
+            env=env,
+            home_dir=home_dir,
+            registry=registry,
+            disk_size_gb=disk_size_gb,
         )
 
     return _build
@@ -952,7 +1615,7 @@ def _boxlite_section(raw: dict[str, object]) -> dict[str, object]:
     return section
 
 
-def _reject_unknown_boxlite_keys(mapping: dict[str, object], allowed: set[str], path: str) -> None:
+def _reject_unknown_keys(mapping: dict[str, object], allowed: set[str], path: str) -> None:
     """
     Fail loud on any key outside *allowed* — catches typos and misplaced keys
     (e.g. ``endpoint`` at the section level instead of under ``cloud:``, or a
@@ -1003,7 +1666,7 @@ def _parse_boxlite_mode(
     if cloud_present:
         if not isinstance(cloud_block, dict):
             raise ValueError("server config 'sandbox.boxlite.cloud' must be a mapping")
-        _reject_unknown_boxlite_keys(cloud_block, {"endpoint"}, "sandbox.boxlite.cloud")
+        _reject_unknown_keys(cloud_block, {"endpoint"}, "sandbox.boxlite.cloud")
         endpoint = cloud_block.get("endpoint")
         if not isinstance(endpoint, str) or not endpoint.strip():
             raise ValueError(
@@ -1016,7 +1679,7 @@ def _parse_boxlite_mode(
         return None, None, None
     if not isinstance(local_block, dict):
         raise ValueError("server config 'sandbox.boxlite.local' must be a mapping")
-    _reject_unknown_boxlite_keys(local_block, {"home_dir", "registry"}, "sandbox.boxlite.local")
+    _reject_unknown_keys(local_block, {"home_dir", "registry"}, "sandbox.boxlite.local")
     return None, _parse_boxlite_home_dir(local_block), _parse_boxlite_registry(local_block)
 
 
@@ -1097,7 +1760,7 @@ def _parse_boxlite_registry(local: dict[str, object]) -> dict[str, object] | Non
         return None
     if not isinstance(registry, dict):
         raise ValueError("server config 'sandbox.boxlite.local.registry' must be a mapping")
-    _reject_unknown_boxlite_keys(
+    _reject_unknown_keys(
         registry,
         {"host", "transport", "skip_verify", "username_env", "password_env", "token_env"},
         "sandbox.boxlite.local.registry",
@@ -1137,10 +1800,10 @@ def _parse_boxlite_registry(local: dict[str, object]) -> dict[str, object] | Non
 def _cwsandbox_launcher_factory(
     image: str | None,
     env: list[str] | None,
-) -> Callable[[], SandboxLauncher]:
+) -> Callable[[], SandboxHostLauncher]:
     """Build the launcher factory for the YAML ``provider: cwsandbox`` path."""
 
-    def _build() -> SandboxLauncher:
+    def _build() -> SandboxHostLauncher:
         from omnigent.onboarding.sandboxes.cwsandbox import CWSandboxLauncher
 
         return CWSandboxLauncher(image=image, env=env)
@@ -1189,7 +1852,7 @@ def _parse_cwsandbox_env(raw: dict[str, object]) -> list[str] | None:
 def _e2b_launcher_factory(
     template: str | None,
     env: list[str] | None,
-) -> Callable[[], SandboxLauncher]:
+) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: e2b`` path.
 
@@ -1207,7 +1870,7 @@ def _e2b_launcher_factory(
     :returns: A factory producing parameterized E2B launchers.
     """
 
-    def _build() -> SandboxLauncher:
+    def _build() -> SandboxHostLauncher:
         """Construct the E2B launcher (lazy SDK import inside)."""
         from omnigent.onboarding.sandboxes.e2b import E2BSandboxLauncher
 
@@ -1286,7 +1949,7 @@ def _islo_launcher_factory(
     memory_mb: int | None,
     disk_gb: int | None,
     idle_pause_after_s: int | None,
-) -> Callable[[], SandboxLauncher]:
+) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: islo`` path.
 
@@ -1310,7 +1973,7 @@ def _islo_launcher_factory(
     :returns: A factory producing parameterized Islo launchers.
     """
 
-    def _build() -> SandboxLauncher:
+    def _build() -> SandboxHostLauncher:
         """Construct the Islo launcher."""
         from omnigent.onboarding.sandboxes.islo import IsloSandboxLauncher
 
@@ -1330,12 +1993,108 @@ def _islo_launcher_factory(
     return _build
 
 
+# Tenki's SDK-enforced create-time resource bounds (mirrors
+# tenki_sandbox._resource_validation): vCPU 1..16, memory 128..65536 MiB
+# aligned to 2 MiB, root disk 5..100 GiB. Enforced at parse time so an
+# out-of-range value stops server startup instead of 502-ing the first
+# managed launch (the SDK would otherwise reject it before the create RPC).
+_TENKI_MIN_VCPUS, _TENKI_MAX_VCPUS = 1, 16
+_TENKI_MIN_MEMORY_MB, _TENKI_MAX_MEMORY_MB = 128, 65536
+_TENKI_MIN_DISK_GB, _TENKI_MAX_DISK_GB = 5, 100
+
+
+def _parse_tenki_bounded_int(
+    raw: dict[str, object], key: str, minimum: int, maximum: int, *, align2: bool = False
+) -> int | None:
+    """
+    Parse a Tenki resource field, rejecting values outside Tenki's bounds.
+
+    Reuses :func:`_parse_provider_positive_int` for the optional / type /
+    bool / positive checks, then enforces the documented ``[minimum,
+    maximum]`` range and (for memory) 2 MiB alignment — so an invalid
+    deployment fails at server startup with the offending key named,
+    rather than at the first managed launch's create RPC.
+
+    :param raw: The raw ``sandbox`` mapping (provider already ``"tenki"``).
+    :param key: The field name under ``sandbox.tenki``, e.g. ``"vcpus"``.
+    :param minimum: Inclusive lower bound.
+    :param maximum: Inclusive upper bound.
+    :param align2: When ``True``, also require the value to be even (the
+        SDK's 2 MiB memory alignment).
+    :returns: The validated value, or ``None`` when the field is absent.
+    :raises ValueError: When the value is out of range or misaligned.
+    """
+    value = _parse_provider_positive_int(raw, "tenki", key)
+    if value is None:
+        return None
+    if not minimum <= value <= maximum:
+        raise ValueError(
+            f"server config 'sandbox.tenki.{key}' must be between {minimum} and "
+            f"{maximum} (got {value})"
+        )
+    if align2 and value % 2 != 0:
+        raise ValueError(
+            f"server config 'sandbox.tenki.{key}' must be aligned to 2 MiB (got {value})"
+        )
+    return value
+
+
+def _tenki_launcher_factory(
+    *,
+    image: str | None,
+    env: list[str] | None,
+    base_url: str | None,
+    workspace: str | None,
+    vcpus: int | None,
+    memory_mb: int | None,
+    disk_gb: int | None,
+) -> Callable[[], SandboxHostLauncher]:
+    """
+    Build the launcher factory for the YAML ``provider: tenki`` path.
+
+    :param image: Tenki registry image reference the Omnigent host was
+        baked into (``<workspace>/<name>:tag``), or ``None`` to resolve
+        the launcher's env-var fallback. Unlike the official prebaked
+        image the other providers default to, Tenki has no built-in
+        default (registry refs are workspace-scoped), so provisioning
+        fails fast when neither this nor the env var is set — see
+        :class:`omnigent.onboarding.sandboxes.tenki.TenkiSandboxLauncher`.
+    :param env: Names of server-process environment variables (harness
+        LLM credentials, gateway URLs, ``GIT_TOKEN``) injected into every
+        sandbox, e.g. ``["OPENAI_API_KEY", "GIT_TOKEN"]``, or ``None`` to
+        resolve from the launcher's env-var fallback / inject nothing.
+    :param base_url: Optional Tenki API endpoint override.
+    :param workspace: Optional Tenki workspace id to create sessions in.
+    :param vcpus: Optional vCPU count.
+    :param memory_mb: Optional memory allocation in MiB.
+    :param disk_gb: Optional root disk size in GiB.
+    :returns: A factory producing parameterized Tenki launchers.
+    """
+
+    def _build() -> SandboxHostLauncher:
+        """Construct the Tenki launcher (lazy SDK import inside)."""
+        from omnigent.onboarding.sandboxes.tenki import TenkiSandboxLauncher
+
+        return TenkiSandboxLauncher(
+            image=image,
+            env=env,
+            base_url=base_url,
+            workspace=workspace,
+            vcpus=vcpus,
+            memory_mb=memory_mb,
+            disk_gb=disk_gb,
+        )
+
+    return _build
+
+
 def _openshell_launcher_factory(
     *,
     image: str | None,
     env: list[str] | None,
     cluster: str | None,
-) -> Callable[[], SandboxLauncher]:
+    workspace: str | None,
+) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: openshell`` path.
 
@@ -1348,14 +2107,17 @@ def _openshell_launcher_factory(
     :param cluster: OpenShell gateway name to connect to, or ``None`` to
         use the active gateway (``$OPENSHELL_GATEWAY`` /
         ``~/.config/openshell/active_gateway``).
+    :param workspace: OpenShell workspace for sandbox lifecycle, or
+        ``None`` to resolve from ``$OMNIGENT_OPENSHELL_WORKSPACE``
+        then ``"default"``.
     :returns: A factory producing parameterized OpenShell launchers.
     """
 
-    def _build() -> SandboxLauncher:
+    def _build() -> SandboxHostLauncher:
         """Construct the OpenShell launcher (lazy SDK import inside)."""
         from omnigent.onboarding.sandboxes.openshell import OpenShellSandboxLauncher
 
-        return OpenShellSandboxLauncher(image=image, env=env, cluster=cluster)
+        return OpenShellSandboxLauncher(image=image, env=env, cluster=cluster, workspace=workspace)
 
     return _build
 
@@ -1578,6 +2340,7 @@ def _validate_kubernetes_identifiers(
     secret_name: str | None,
     service_account: str | None,
     node_selector: dict[str, str] | None,
+    runtime_class: str | None,
 ) -> None:
     """
     Validate the YAML ``sandbox.kubernetes`` identifiers at parse time.
@@ -1588,6 +2351,7 @@ def _validate_kubernetes_identifiers(
     _validate_dns1123_label(namespace, "namespace")
     _validate_dns1123_subdomain(secret_name, "secret_name")
     _validate_dns1123_subdomain(service_account, "service_account")
+    _validate_dns1123_subdomain(runtime_class, "runtime_class")
     for key, value in (node_selector or {}).items():
         if not _validate_label_key(key):
             raise ValueError(
@@ -1661,6 +2425,235 @@ def _parse_kubernetes_resources(raw: dict[str, object]) -> dict[str, object] | N
     return normalized
 
 
+# Path prefixes a pvc_mounts mount_path may not overlap — neither sitting at
+# or under one, nor mounting over one from an ancestor (a PVC at /home would
+# shadow the /home/omnigent mountpoint): the runner's writable-HOME emptyDir
+# (mirrors the launcher's _HOME_DIR — pinned by test), Kubernetes Secret
+# projections, the image's OS / scratch directories, and /opt (the host
+# image's omnigent venv lives at /opt/venv).
+_KUBERNETES_RESERVED_MOUNT_PREFIXES: tuple[str, ...] = (
+    "/home/omnigent",
+    # Secret projections live under /var/run/secrets; the Debian-based host
+    # image symlinks /var/run -> /run and /var/lock -> /run/lock, so every
+    # spelling is reserved in full to keep the lexical check consistent
+    # across the aliases.
+    "/var/run",
+    "/var/lock",
+    "/run",
+    "/tmp",
+    "/etc",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib64",
+    "/opt",
+    "/proc",
+    "/sys",
+    "/dev",
+)
+
+
+def _parse_kubernetes_pvc_mounts(raw: dict[str, object]) -> list[dict[str, object]] | None:
+    """
+    Extract and validate the optional ``sandbox.kubernetes.pvc_mounts`` list.
+
+    Each entry references a PersistentVolumeClaim the operator pre-created in
+    the runner namespace: ``{claim_name, mount_path, read_only?}`` with
+    ``read_only`` defaulting to ``True``. Validated at parse time so an
+    operator typo fails server startup instead of the first managed launch.
+
+    :param raw: The raw ``sandbox`` mapping.
+    :returns: Normalized entries, or ``None`` when omitted or empty.
+    :raises ValueError: When the list or any entry has the wrong shape, a name
+        or path is malformed, a path is reserved, or paths collide.
+    """
+    section = _parse_provider_section(raw, "kubernetes")
+    if section is None:
+        return None
+    value = section.get("pvc_mounts")
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ValueError(
+            "server config 'sandbox.kubernetes.pvc_mounts' must be a list of "
+            "{claim_name, mount_path, read_only?} entries"
+        )
+    normalized: list[dict[str, object]] = []
+    for i, entry in enumerate(value):
+        path_prefix = f"sandbox.kubernetes.pvc_mounts[{i}]"
+        if not isinstance(entry, dict):
+            raise ValueError(f"server config '{path_prefix}' must be a mapping")
+        _reject_unknown_keys(entry, {"claim_name", "mount_path", "read_only"}, path_prefix)
+        claim = entry.get("claim_name")
+        if not isinstance(claim, str) or not claim.strip():
+            raise ValueError(
+                f"server config '{path_prefix}.claim_name' must name a "
+                "PersistentVolumeClaim pre-created in the runner namespace"
+            )
+        claim = claim.strip()
+        _validate_dns1123_subdomain(claim, f"pvc_mounts[{i}].claim_name")
+        mount = entry.get("mount_path")
+        if not isinstance(mount, str) or not mount.startswith("/"):
+            raise ValueError(
+                f"server config '{path_prefix}.mount_path' must be an absolute "
+                "in-Pod path, e.g. '/mnt/datasets'"
+            )
+        # normpath preserves exactly two leading slashes (POSIX), but the
+        # kernel collapses them at mount time — reject them explicitly so
+        # '//home/omnigent' cannot slip past the reserved-prefix check.
+        if mount.startswith("//") or mount != posixpath.normpath(mount):
+            raise ValueError(
+                f"server config '{path_prefix}.mount_path' must be a normalized "
+                f"path (no '..', '.', doubled or trailing slashes): {mount!r}"
+            )
+        if mount == "/" or any(
+            mount == p or mount.startswith(p + "/") or p.startswith(mount + "/")
+            for p in _KUBERNETES_RESERVED_MOUNT_PREFIXES
+        ):
+            raise ValueError(
+                f"server config '{path_prefix}.mount_path' overlaps a reserved "
+                f"path: {mount!r} (the runner's HOME, Secret projections, and OS "
+                "directories cannot be shadowed or mounted over)"
+            )
+        read_only = entry.get("read_only", True)
+        if not isinstance(read_only, bool):
+            raise ValueError(f"server config '{path_prefix}.read_only' must be a boolean")
+        normalized.append({"claim_name": claim, "mount_path": mount, "read_only": read_only})
+    for a, b in itertools.combinations(normalized, 2):
+        pa, pb = str(a["mount_path"]), str(b["mount_path"])
+        if pa == pb:
+            raise ValueError(
+                f"server config 'sandbox.kubernetes.pvc_mounts' has a duplicate mount_path: {pa!r}"
+            )
+        low, high = sorted((pa, pb), key=len)
+        if high.startswith(low + "/"):
+            raise ValueError(
+                "server config 'sandbox.kubernetes.pvc_mounts' has nested "
+                f"mount_paths: {low!r} contains {high!r}"
+            )
+    return normalized or None
+
+
+def _parse_kubernetes_secret_mounts(raw: dict[str, object]) -> list[dict[str, object]] | None:
+    """
+    Extract and validate the optional ``sandbox.kubernetes.secret_mounts`` list.
+
+    Each entry references a Kubernetes Secret the operator pre-created in the
+    runner namespace and projects it as a **file volume** on the host
+    container: ``{secret_name, mount_path}``. A Secret volume is refreshed in
+    place by the kubelet, so a long-lived runner picks up a rotated credential
+    without a restart — unlike ``envFrom``, frozen at container start. Refresh
+    is eventually consistent (kubelet sync, up to ~1 min), so the consumer
+    must re-read the file each use. Secret volumes are read-only, so there is
+    no ``read_only`` knob. Validated at parse time so an operator typo fails
+    server startup, not the first launch.
+
+    :param raw: The raw ``sandbox`` mapping.
+    :returns: Normalized entries, or ``None`` when omitted or empty.
+    :raises ValueError: When the list or any entry has the wrong shape, a name
+        or path is malformed, a path is reserved, or paths collide.
+    """
+    section = _parse_provider_section(raw, "kubernetes")
+    if section is None:
+        return None
+    value = section.get("secret_mounts")
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ValueError(
+            "server config 'sandbox.kubernetes.secret_mounts' must be a list of "
+            "{secret_name, mount_path} entries"
+        )
+    normalized: list[dict[str, object]] = []
+    for i, entry in enumerate(value):
+        path_prefix = f"sandbox.kubernetes.secret_mounts[{i}]"
+        if not isinstance(entry, dict):
+            raise ValueError(f"server config '{path_prefix}' must be a mapping")
+        _reject_unknown_keys(entry, {"secret_name", "mount_path"}, path_prefix)
+        secret = entry.get("secret_name")
+        if not isinstance(secret, str) or not secret.strip():
+            raise ValueError(
+                f"server config '{path_prefix}.secret_name' must name a "
+                "Secret pre-created in the runner namespace"
+            )
+        secret = secret.strip()
+        _validate_dns1123_subdomain(secret, f"secret_mounts[{i}].secret_name")
+        mount = entry.get("mount_path")
+        if not isinstance(mount, str) or not mount.startswith("/"):
+            raise ValueError(
+                f"server config '{path_prefix}.mount_path' must be an absolute "
+                "in-Pod path, e.g. '/mnt/secrets/git'"
+            )
+        # normpath preserves exactly two leading slashes (POSIX), but the
+        # kernel collapses them at mount time — reject them explicitly so
+        # '//home/omnigent' cannot slip past the reserved-prefix check.
+        if mount.startswith("//") or mount != posixpath.normpath(mount):
+            raise ValueError(
+                f"server config '{path_prefix}.mount_path' must be a normalized "
+                f"path (no '..', '.', doubled or trailing slashes): {mount!r}"
+            )
+        if mount == "/" or any(
+            mount == p or mount.startswith(p + "/") or p.startswith(mount + "/")
+            for p in _KUBERNETES_RESERVED_MOUNT_PREFIXES
+        ):
+            raise ValueError(
+                f"server config '{path_prefix}.mount_path' overlaps a reserved "
+                f"path: {mount!r} (the runner's HOME, Secret projections, and OS "
+                "directories cannot be shadowed or mounted over)"
+            )
+        normalized.append({"secret_name": secret, "mount_path": mount})
+    for a, b in itertools.combinations(normalized, 2):
+        pa, pb = str(a["mount_path"]), str(b["mount_path"])
+        if pa == pb:
+            raise ValueError(
+                "server config 'sandbox.kubernetes.secret_mounts' has a "
+                f"duplicate mount_path: {pa!r}"
+            )
+        low, high = sorted((pa, pb), key=len)
+        if high.startswith(low + "/"):
+            raise ValueError(
+                "server config 'sandbox.kubernetes.secret_mounts' has nested "
+                f"mount_paths: {low!r} contains {high!r}"
+            )
+    return normalized or None
+
+
+def _reject_overlapping_kubernetes_mounts(
+    pvc_mounts: list[dict[str, object]] | None,
+    secret_mounts: list[dict[str, object]] | None,
+) -> None:
+    """
+    Reject a ``pvc_mounts`` path that duplicates or nests with a ``secret_mounts`` path.
+
+    Each list is already de-conflicted internally by its own parser; this
+    catches a collision *across* the two mount types (e.g. a PVC at ``/mnt/x``
+    and a Secret at ``/mnt/x/token``), which would otherwise produce nested
+    volume mounts on the host container.
+
+    :param pvc_mounts: Normalized PVC mounts, or ``None``.
+    :param secret_mounts: Normalized Secret mounts, or ``None``.
+    :raises ValueError: When a PVC and a Secret mount_path are equal or nested.
+    """
+    if not pvc_mounts or not secret_mounts:
+        return
+    for pvc in pvc_mounts:
+        pa = str(pvc["mount_path"])
+        for secret in secret_mounts:
+            sb = str(secret["mount_path"])
+            if pa == sb:
+                raise ValueError(
+                    "server config 'sandbox.kubernetes' uses the same mount_path "
+                    f"for a PVC and a Secret: {pa!r}"
+                )
+            low, high = sorted((pa, sb), key=len)
+            if high.startswith(low + "/"):
+                raise ValueError(
+                    "server config 'sandbox.kubernetes' has nested pvc_mounts / "
+                    f"secret_mounts paths: {low!r} contains {high!r}"
+                )
+
+
 def _kubernetes_launcher_factory(
     *,
     image: str | None,
@@ -1672,7 +2665,11 @@ def _kubernetes_launcher_factory(
     kubeconfig: str | None,
     in_cluster: bool | None,
     resources: dict[str, object] | None,
-) -> Callable[[], SandboxLauncher]:
+    pvc_mounts: list[dict[str, object]] | None,
+    secret_mounts: list[dict[str, object]] | None,
+    pod_ready_timeout_s: int | None,
+    runtime_class: str | None,
+) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: kubernetes`` path.
 
@@ -1693,12 +2690,23 @@ def _kubernetes_launcher_factory(
     :param in_cluster: Force the cluster-config source, or ``None`` to try
         in-cluster then fall back to kubeconfig.
     :param resources: Validated ``resources`` block, or ``None`` for defaults.
+    :param pvc_mounts: Normalized PVC mount entries added to every runner Pod,
+        or ``None``.
+    :param secret_mounts: Normalized Secret file-mount entries added to every
+        runner Pod (rotation-friendly credential volumes), or ``None``.
+    :param pod_ready_timeout_s: Pod-start wait budget in seconds, or ``None``
+        for the launcher's built-in default.
+    :param runtime_class: ``RuntimeClass`` name every runner Pod is scheduled
+        under as ``spec.runtimeClassName`` (e.g. ``kata`` for micro-VM
+        isolation), or ``None`` for the cluster's default runtime.
     :returns: A factory producing parameterized Kubernetes launchers.
     :raises ValueError: When a name or node-selector label is malformed.
     """
-    _validate_kubernetes_identifiers(namespace, secret_name, service_account, node_selector)
+    _validate_kubernetes_identifiers(
+        namespace, secret_name, service_account, node_selector, runtime_class
+    )
 
-    def _build() -> SandboxLauncher:
+    def _build() -> SandboxHostLauncher:
         """Construct the Kubernetes launcher (lazy SDK import inside)."""
         from omnigent.onboarding.sandboxes.kubernetes import KubernetesSandboxLauncher
 
@@ -1712,17 +2720,49 @@ def _kubernetes_launcher_factory(
             kubeconfig=kubeconfig,
             in_cluster=in_cluster,
             resources=resources,
+            pvc_mounts=pvc_mounts,
+            secret_mounts=secret_mounts,
+            pod_ready_timeout_s=pod_ready_timeout_s,
+            runtime_class=runtime_class,
         )
 
     return _build
 
 
+def _select_provider_config(
+    deployment: ManagedSandboxDeployment,
+    provider: str | None,
+) -> ManagedSandboxConfig:
+    """
+    Narrow a deployment to the one provider config a launch runs on.
+
+    :param deployment: The deployment's offered providers.
+    :param provider: Requested provider short name, or ``None`` for the
+        deployment default.
+    :returns: The single-provider config to launch with.
+    :raises HTTPException: 400 when *provider* is not configured.
+    """
+    selected = deployment.for_provider(provider)
+    if selected is None:
+        offered = ", ".join(deployment.launchable_providers()) or "none"
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"sandbox provider '{provider}' is not configured on this "
+                f"server — available: {offered}"
+            ),
+        )
+    return selected
+
+
 async def launch_managed_host(
     *,
-    config: ManagedSandboxConfig,
+    config: ManagedSandboxDeployment,
     owner: str,
     host_store: HostStore,
     repo: RepoWorkspace | None = None,
+    provider: str | None = None,
+    agent_name: str | None = None,
     on_stage: Callable[[str], None] | None = None,
 ) -> ManagedHostLaunch:
     """
@@ -1737,8 +2777,8 @@ async def launch_managed_host(
     and deletes the host row (which revokes the token) before
     re-raising.
 
-    :param config: The deployment's sandbox config (YAML-parsed or
-        directly constructed with a custom launcher factory).
+    :param config: The deployment's offered providers (YAML-parsed or
+        wrapped around a directly-constructed embedding config).
     :param owner: User the managed host acts for — the session
         creator, e.g. ``"alice@example.com"`` (or the reserved local
         user on single-user servers).
@@ -1751,6 +2791,13 @@ async def launch_managed_host(
         host image's git credential helper when the sandbox env
         carries ``GIT_TOKEN`` (injected through Modal secrets — see
         deploy/modal/README.md "Git credentials").
+    :param provider: Which configured provider to launch on, e.g.
+        ``"modal"``. ``None`` takes the deployment's default (first)
+        provider — what a request that names none gets.
+    :param agent_name: Server-resolved built-in agent name the session runs,
+        stamped as the runner Pod's ``omnigent.ai/agent`` classifier by
+        providers that declare ``classifies_runner_by_agent`` (Kubernetes),
+        or ``None`` to leave it unstamped.
     :param on_stage: Progress observer invoked as the launch pipeline
         advances, with the stage just entered: ``"cloning"`` (when
         *repo* is set) then ``"starting"``. May be called from a
@@ -1759,11 +2806,12 @@ async def launch_managed_host(
         disables progress reporting.
     :returns: The registered host id + in-sandbox workspace path
         (the cloned repository directory when *repo* is set).
-    :raises HTTPException: 400 when the configured provider lacks
-        managed-launch support; 502 when provisioning, cloning, host
-        startup, or registration fails.
+    :raises HTTPException: 400 when *provider* is not configured or the
+        selected provider lacks managed-launch support; 502 when
+        provisioning, cloning, host startup, or registration fails.
     """
-    launcher = config.launcher_factory()
+    entry = _select_provider_config(config, provider)
+    launcher = entry.launcher_factory()
     host_id = uuid.uuid4().hex
     # Visible label in the host picker; (owner, name) is the hosts
     # table PK, so embed the host_id's leading hex for uniqueness
@@ -1779,13 +2827,14 @@ async def launch_managed_host(
         ) from exc
     workspace = await _arm_and_start_host(
         launcher=launcher,
-        config=config,
+        config=entry,
         host_store=host_store,
         host_id=host_id,
         host_name=host_name,
         owner=owner,
         sandbox_id=sandbox_id,
         repo=repo,
+        agent_name=agent_name,
         on_stage=on_stage,
     )
     return ManagedHostLaunch(host_id=host_id, workspace=workspace)
@@ -1793,10 +2842,11 @@ async def launch_managed_host(
 
 async def relaunch_managed_host(
     *,
-    config: ManagedSandboxConfig,
+    config: ManagedSandboxDeployment,
     host: Host,
     host_store: HostStore,
     repo: RepoWorkspace | None = None,
+    agent_name: str | None = None,
     on_stage: Callable[[str], None] | None = None,
 ) -> ManagedHostLaunch:
     """
@@ -1818,12 +2868,15 @@ async def relaunch_managed_host(
     new sandbox is torn down and the armed token revoked), so the
     session binding survives and a later attempt can retry.
 
-    :param config: The deployment's sandbox config.
+    :param config: The deployment's offered providers.
     :param host: The existing managed host row to relaunch
         (``sandbox_provider`` set; callers guard on that).
     :param host_store: Persistent host registrations.
     :param repo: Repository to re-clone as the workspace, or ``None``
         for an empty workspace.
+    :param agent_name: Server-resolved built-in agent name the session runs,
+        re-stamped as the new runner Pod's ``omnigent.ai/agent`` classifier
+        (Kubernetes only), or ``None`` to leave it unstamped.
     :param on_stage: Progress observer forwarded to
         :func:`_arm_and_start_host`; see :func:`launch_managed_host`.
         ``None`` disables progress reporting.
@@ -1841,6 +2894,9 @@ async def relaunch_managed_host(
                 "was launched with is no longer configured on this server"
             ),
         )
+    # Stay on the host's provider so the new generation is armed with ITS
+    # token TTL, not the deployment default's.
+    entry = config.recorded(host.sandbox_provider)
     # The old generation is normally already dead (that is why we are
     # here), but terminate defensively so a transient tunnel outage
     # can never leave two live sandboxes claiming one host identity.
@@ -1855,22 +2911,116 @@ async def relaunch_managed_host(
         ) from exc
     workspace = await _arm_and_start_host(
         launcher=launcher,
-        config=config,
+        config=entry,
         host_store=host_store,
         host_id=host.host_id,
         host_name=host.name,
-        owner=host.owner,
+        owner=host.user_id,
         sandbox_id=sandbox_id,
         repo=repo,
+        agent_name=agent_name,
         on_stage=on_stage,
         keep_host_on_failure=True,
     )
     return ManagedHostLaunch(host_id=host.host_id, workspace=workspace)
 
 
+async def _start_sandbox_host(
+    launcher: SandboxHostLauncher,
+    sandbox_id: str,
+    *,
+    token: str,
+    host_id: str,
+    host_name: str,
+    server_url: str,
+    repo_url: str | None,
+    repo_branch: str | None,
+    repo_name: str | None,
+    host_config: dict[str, object] | None,
+    agent_name: str | None = None,
+    on_stage: Callable[[str], None] | None = None,
+) -> str:
+    """Start a host without sending absent optional arguments to legacy launchers."""
+    # Gated on the capability, not on the value: start_host is side-effecting and
+    # non-idempotent, so we never probe the signature by passing then retrying.
+    # `agent_name` is declared on the classifying launcher's `start_host` alone,
+    # so the abstract signature does not carry it and the call is cast: the
+    # capability is the runtime guarantee the static type cannot express. A
+    # launcher declaring it is in-tree and current, so it also takes
+    # `host_config`/`on_stage`, keeping the legacy-omission fan-out below
+    # one-dimensional.
+    if agent_name is not None and launcher.capabilities.classifies_runner_by_agent:
+        start_classified = cast(Callable[..., str], launcher.start_host)
+        return await asyncio.to_thread(
+            start_classified,
+            sandbox_id,
+            token=token,
+            host_id=host_id,
+            host_name=host_name,
+            server_url=server_url,
+            repo_url=repo_url,
+            repo_branch=repo_branch,
+            repo_name=repo_name,
+            host_config=host_config,
+            on_stage=on_stage,
+            agent_name=agent_name,
+        )
+    if host_config is None and on_stage is None:
+        return await asyncio.to_thread(
+            launcher.start_host,
+            sandbox_id,
+            token=token,
+            host_id=host_id,
+            host_name=host_name,
+            server_url=server_url,
+            repo_url=repo_url,
+            repo_branch=repo_branch,
+            repo_name=repo_name,
+        )
+    if host_config is None:
+        return await asyncio.to_thread(
+            launcher.start_host,
+            sandbox_id,
+            token=token,
+            host_id=host_id,
+            host_name=host_name,
+            server_url=server_url,
+            repo_url=repo_url,
+            repo_branch=repo_branch,
+            repo_name=repo_name,
+            on_stage=on_stage,
+        )
+    if on_stage is None:
+        return await asyncio.to_thread(
+            launcher.start_host,
+            sandbox_id,
+            token=token,
+            host_id=host_id,
+            host_name=host_name,
+            server_url=server_url,
+            repo_url=repo_url,
+            repo_branch=repo_branch,
+            repo_name=repo_name,
+            host_config=host_config,
+        )
+    return await asyncio.to_thread(
+        launcher.start_host,
+        sandbox_id,
+        token=token,
+        host_id=host_id,
+        host_name=host_name,
+        server_url=server_url,
+        repo_url=repo_url,
+        repo_branch=repo_branch,
+        repo_name=repo_name,
+        host_config=host_config,
+        on_stage=on_stage,
+    )
+
+
 async def _arm_and_start_host(
     *,
-    launcher: SandboxLauncher,
+    launcher: SandboxHostLauncher,
     config: ManagedSandboxConfig,
     host_store: HostStore,
     host_id: str,
@@ -1878,6 +3028,7 @@ async def _arm_and_start_host(
     owner: str,
     sandbox_id: str,
     repo: RepoWorkspace | None = None,
+    agent_name: str | None = None,
     on_stage: Callable[[str], None] | None = None,
     keep_host_on_failure: bool = False,
 ) -> str:
@@ -1905,6 +3056,10 @@ async def _arm_and_start_host(
     :param sandbox_id: The provisioned sandbox, e.g. ``"sb-a1b2c3"``.
     :param repo: Repository to clone as the workspace, or ``None``
         for an empty workspace.
+    :param agent_name: Server-resolved built-in agent name the session runs,
+        forwarded to ``start_host`` only for launchers that declare
+        ``classifies_runner_by_agent`` (Kubernetes stamps it as the runner
+        Pod's ``omnigent.ai/agent`` classifier). ``None`` leaves it unstamped.
     :param on_stage: Progress observer forwarded to the launcher's
         ``start_host``; see :func:`launch_managed_host`. ``None``
         disables progress reporting.
@@ -1920,7 +3075,7 @@ async def _arm_and_start_host(
         host_store.register_managed_host,
         host_id=host_id,
         name=host_name,
-        owner=owner,
+        user_id=owner,
         token=token,
         provider=launcher.provider,
         sandbox_id=sandbox_id,
@@ -1932,8 +3087,8 @@ async def _arm_and_start_host(
         # a token that already resolves. The exec-model default execs in; the
         # entrypoint model (k8s) creates the Pod that boots the host. *repo* is
         # unpacked into primitives — the launcher API takes no RepoWorkspace.
-        workspace = await asyncio.to_thread(
-            launcher.start_host,
+        workspace = await _start_sandbox_host(
+            launcher,
             sandbox_id,
             token=token,
             host_id=host_id,
@@ -1942,6 +3097,8 @@ async def _arm_and_start_host(
             repo_url=repo.url if repo is not None else None,
             repo_branch=repo.branch if repo is not None else None,
             repo_name=repo.repo_name if repo is not None else None,
+            host_config=config.host_config,
+            agent_name=agent_name,
             on_stage=on_stage,
         )
         await _wait_for_host_online(host_store, host_id)
@@ -1957,7 +3114,11 @@ async def _arm_and_start_host(
             await _terminate_sandbox_best_effort(launcher, record)
             await asyncio.to_thread(host_store.revoke_launch_token, host_id)
         else:
-            await terminate_managed_host(record, host_store, config)
+            # The row was just armed with THIS single-provider config, so a
+            # one-provider deployment tears it back down with the same launcher.
+            await terminate_managed_host(
+                record, host_store, ManagedSandboxDeployment.single(config)
+            )
         if isinstance(exc, HTTPException):
             raise
         message = exc.message if isinstance(exc, click.ClickException) else str(exc)
@@ -1994,8 +3155,8 @@ async def _wait_for_host_online(host_store: HostStore, host_id: str) -> None:
 
 def _launcher_for_teardown(
     host: Host,
-    config: ManagedSandboxConfig | None,
-) -> SandboxLauncher | None:
+    config: ManagedSandboxDeployment | None,
+) -> SandboxHostLauncher | None:
     """
     Resolve the launcher that can terminate a managed host's sandbox.
 
@@ -2003,6 +3164,10 @@ def _launcher_for_teardown(
     provider matches the provider recorded on the host row at launch —
     a config change between launch and teardown must not aim a
     different provider's terminate at a stale sandbox id.
+
+    The row's recorded provider picks which config to build from: a host
+    must be torn down by the provider that launched it, never by
+    whichever is configured first.
 
     :param host: The managed host being torn down.
     :param config: The deployment's current sandbox config, or ``None``
@@ -2012,8 +3177,9 @@ def _launcher_for_teardown(
     """
     if config is None:
         return None
+    entry = config.recorded(host.sandbox_provider)
     try:
-        launcher = config.launcher_factory()
+        launcher = entry.launcher_factory()
     except HTTPException:
         # The YAML path's unsupported-provider factory raises; there is
         # no launcher to terminate with.
@@ -2025,7 +3191,7 @@ def _launcher_for_teardown(
 
 def host_resume_supported(
     host: Host,
-    config: ManagedSandboxConfig | None,
+    config: ManagedSandboxDeployment | None,
 ) -> bool:
     """
     Whether :func:`resume_managed_host` could wake this host in place.
@@ -2047,12 +3213,16 @@ def host_resume_supported(
         host with no recorded ``sandbox_id``.
     """
     launcher = _launcher_for_teardown(host, config)
-    return launcher is not None and launcher.can_resume and host.sandbox_id is not None
+    return (
+        launcher is not None
+        and launcher.capabilities.resume_stopped
+        and host.sandbox_id is not None
+    )
 
 
 def host_sandbox_is_running(
     host: Host,
-    config: ManagedSandboxConfig | None,
+    config: ManagedSandboxDeployment | None,
 ) -> bool | None:
     """
     Ask the matched provider whether this managed host's sandbox is running.
@@ -2079,9 +3249,10 @@ _resume_locks: dict[str, asyncio.Lock] = {}
 async def resume_managed_host(
     host_id: str,
     host_store: HostStore,
-    config: ManagedSandboxConfig | None,
+    config: ManagedSandboxDeployment | None,
     *,
     force: bool = False,
+    on_stage: Callable[[str], None] | None = None,
 ) -> None:
     """
     Wake a dormant managed host so a session bound to it can run again.
@@ -2111,6 +3282,12 @@ async def resume_managed_host(
         the ``sandbox:`` section has been removed since launch.
     :param force: Skip the DB-liveness no-op gate when the caller has local
         evidence that the tunnel is gone.
+    :param on_stage: Progress observer forwarded to the launcher's
+        ``start_host`` (via :func:`_start_sandbox_host`), so a wake reports the
+        launch-pipeline ``"starting"`` stage to the caller's progress surface
+        exactly like a fresh launch (:func:`_arm_and_start_host`) — without it a
+        wake shows a single frozen ``"provisioning"`` band for its whole
+        duration. ``None`` disables progress reporting.
     :raises HTTPException: 502 when the resume or host restart fails.
     """
     if config is None:
@@ -2126,8 +3303,10 @@ async def resume_managed_host(
     # Resume needs a reattachable volume; others (e.g. Modal) fall through to
     # the caller's host-offline path (the user starts a new session).
     launcher = _launcher_for_teardown(host, config)
-    if launcher is None or not launcher.can_resume or host.sandbox_id is None:
+    if launcher is None or not launcher.capabilities.resume_stopped or host.sandbox_id is None:
         return
+    # Re-arm with the recorded provider's own TTL / host_config.
+    entry = config.recorded(host.sandbox_provider)
     sandbox_id = host.sandbox_id
     # Single-flight per host (see _resume_locks).
     resume_lock = _resume_locks.setdefault(host_id, asyncio.Lock())
@@ -2152,20 +3331,24 @@ async def resume_managed_host(
                 host_store.register_managed_host,
                 host_id=host.host_id,
                 name=host.name,
-                owner=host.owner,
+                user_id=host.user_id,
                 token=token,
                 provider=launcher.provider,
                 sandbox_id=sandbox_id,
-                token_expires_at=now_epoch() + config.token_ttl_s,
+                token_expires_at=now_epoch() + entry.token_ttl_s,
             )
-            await asyncio.to_thread(
-                launcher.start_host,
+            await _start_sandbox_host(
+                launcher,
                 sandbox_id,
                 token=token,
                 host_id=host.host_id,
                 host_name=host.name,
-                server_url=config.server_url,
+                server_url=entry.server_url,
                 repo_url=None,  # the persistent volume already holds the workspace
+                repo_branch=None,
+                repo_name=None,
+                host_config=entry.host_config,
+                on_stage=on_stage,
             )
             await _wait_for_host_online(host_store, host.host_id)
         except Exception as exc:
@@ -2182,7 +3365,7 @@ async def resume_managed_host(
 async def terminate_managed_host(
     host: Host,
     host_store: HostStore,
-    config: ManagedSandboxConfig | None,
+    config: ManagedSandboxDeployment | None,
 ) -> None:
     """
     Terminate a managed host's sandbox and delete its host row.
@@ -2208,7 +3391,7 @@ async def terminate_managed_host(
 
 
 async def _terminate_sandbox_best_effort(
-    launcher: SandboxLauncher | None,
+    launcher: SandboxHostLauncher | None,
     host: Host,
 ) -> None:
     """

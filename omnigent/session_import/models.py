@@ -9,7 +9,7 @@ from typing import Literal
 from omnigent.entities import MessageData, NewConversationItem
 from omnigent.entities.conversation import synthesize_conversation_title
 
-ImportSource = Literal["claude", "codex"]
+ImportSource = Literal["claude", "codex", "kimi", "kiro", "opencode", "pi", "qwen"]
 
 IMPORT_SOURCE_LABEL_KEY = "omnigent.import.source"
 IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY = "omnigent.import.external_session_id"
@@ -33,11 +33,15 @@ class LocalSessionImport:
     external_session_id: str
     workspace: str | None
     items: tuple[NewConversationItem, ...]
+    # The harness's own session title (Claude's custom/ai title, Codex's thread
+    # title) when the transcript carried one; None to fall back to the first
+    # user message.
+    native_title: str | None = None
 
     @property
     def title(self) -> str | None:
-        """Return a sidebar title derived from the first user message."""
-        return title_from_items(self.items)
+        """Prefer the harness's own title, else derive from the first user message."""
+        return self.native_title or title_from_items(self.items)
 
 
 def title_from_items(items: Sequence[NewConversationItem]) -> str | None:

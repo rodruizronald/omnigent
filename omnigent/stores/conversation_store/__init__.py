@@ -1,5 +1,7 @@
 """Conversation store — manages conversations and their items."""
 
+import hashlib
+import math
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -84,6 +86,69 @@ CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox"
 # and the web client mirrors the literal as ``PROJECT_LABEL_KEY``.
 PROJECT_LABEL_KEY = "omni_project"
 
+# Reserved label-key PREFIX that records whether a session is "pinned" in the
+# sidebar. Pins are PER-USER: the stored key is ``omnigent.pinned.<user_id>``
+# (see :func:`pinned_label_key`), so pinning a session shared with others does
+# not pin it for them, and either party can pin/unpin independently — matching
+# the prior per-user localStorage behaviour. The value is the epoch-ms pin time
+# (any non-empty value means pinned; the row is deleted on unpin), which lets
+# the sidebar order the Pinned section by pin recency (stable under a new
+# message bumping ``updated_at``) and keeps the Cmd+1..0 hotkey slots consistent
+# across a user's devices. Server-side persistence lets a pin follow the user
+# across devices.
+#
+# The bare ``omnigent.pinned`` (no user suffix) is the CANONICAL key the web
+# client reads/writes; the server rewrites it to the caller's per-user key on
+# write and collapses the caller's per-user key back to it on read (see
+# ``_build_session_list_item``), so the per-user dimension never crosses the
+# API boundary — a viewer never sees another user's pin key. The web client
+# mirrors the canonical key as ``PINNED_LABEL_KEY``.
+PINNED_LABEL_KEY = "omnigent.pinned"
+
+# Single-user / no-auth sentinel for the per-user pin key suffix, mirroring the
+# reserved ``"local"`` identity used elsewhere (see ``RESERVED_USER_LOCAL``).
+_PINNED_LABEL_LOCAL_USER = "local"
+
+# ``conversation_labels.key`` is ``String(128)``. The prefix ``omnigent.pinned.``
+# is 16 chars, so a raw ``user_id`` suffix must stay ≤ 112 chars to fit. User ids
+# are ``String(128)`` elsewhere (SSO subject ids can be long), so a raw suffix
+# could overflow the key column — Postgres errors, MySQL silently truncates (and
+# two long ids could then collide on the truncated key). To stay safe while
+# keeping the common case (emails) human-readable in the DB, ids that don't fit
+# are replaced with a fixed-width hash suffix.
+_PINNED_LABEL_MAX_SUFFIX_LEN = 128 - len(PINNED_LABEL_KEY) - 1  # minus the "." joiner
+
+
+def pinned_label_key(user_id: str | None) -> str:
+    """
+    The per-user pinned-label key for ``user_id``.
+
+    Deterministic in ``user_id`` (the write path and the ``pinned=True`` filter
+    derive the key the same way, so they always match). Normal ids are used
+    verbatim for DB readability; an id too long to fit the ``String(128)`` key
+    column is replaced with a fixed-width ``sha256`` suffix so it can never
+    overflow or collide via silent truncation.
+
+    :param user_id: Authenticated user id, e.g. ``"alice@example.com"``, or
+        ``None`` in single-user / no-auth mode (→ the ``local`` sentinel).
+    :returns: ``"omnigent.pinned.<suffix>"`` (suffix = the id, or its hash when
+        the id is too long).
+    """
+    suffix = user_id if user_id is not None else _PINNED_LABEL_LOCAL_USER
+    if len(suffix) > _PINNED_LABEL_MAX_SUFFIX_LEN:
+        # 64 hex chars — well within the budget and collision-safe.
+        suffix = "h:" + hashlib.sha256(suffix.encode("utf-8")).hexdigest()
+    return f"{PINNED_LABEL_KEY}.{suffix}"
+
+
+# Epoch-SECONDS time a session was archived, written on archive and deleted on
+# unarchive. A label rather than a ``conversations`` column, so ageing out old
+# archived sessions needs no schema migration; readers fall back to
+# ``updated_at`` when it is absent. Seconds, not the pin key's epoch-ms, to
+# match that fallback's unit.
+ARCHIVED_AT_LABEL_KEY = "omnigent.archived_at"
+
+
 # Labels that must NOT cross into a new session context — deliberately
 # dropped both when forking (not copied to the clone) and on an in-place
 # agent switch (deleted from the switched session). Two distinct reasons
@@ -114,9 +179,11 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
     }
 )
 
-# Source identity belongs only to the original imported session. Unlike runtime
-# instance labels, these survive an in-place agent switch but never a fork.
-_FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS
+# Source identity belongs only to the original imported session, and a fork is
+# born unarchived so it must not inherit its parent's archive time. Unlike
+# runtime instance labels, these survive an in-place agent switch but never a
+# fork.
+_FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {ARCHIVED_AT_LABEL_KEY}
 
 
 @dataclass(frozen=True)
@@ -154,6 +221,12 @@ class SessionConnectivity:
         dot off while ``runner_id``/``host_id`` are still ``None`` so
         the UI prompts for a host + directory before the clone can run,
         rather than treating it as an in-process session.
+    :param imported: ``True`` when this session was imported from a local
+        harness transcript (the ``omnigent.import.source`` label is set).
+        Like ``needs_workspace``, forces the online dot off while unbound:
+        an imported transcript has no live executor anywhere, so it must
+        launch a runner on a host before it can run — reporting it offline
+        routes the first message into the resume picker.
     :param runner_last_seen: Epoch seconds the bound runner's tunnel was
         last observed alive, written by the replica holding the tunnel.
         ``None`` when never observed (or cleared on graceful disconnect).
@@ -165,6 +238,7 @@ class SessionConnectivity:
     runner_id: str | None
     host_id: str | None
     needs_workspace: bool
+    imported: bool = False
     runner_last_seen: int | None = None
 
 
@@ -222,6 +296,26 @@ class NameAlreadyExistsError(Exception):
     """
 
 
+def _is_addable_usage_increment(value: Any) -> bool:
+    """
+    Return whether *value* is a safe additive ``session_usage`` increment.
+
+    Every production caller (the relay ``_accumulate_session_usage`` path)
+    only ever adds a finite, non-negative count or cost. A negative or
+    non-finite increment is therefore corruption — applied additively it
+    would drive a cumulative counter backwards or poison it with ``NaN`` /
+    ``inf``, and the relay cost-budget gate reads these very totals — so
+    :func:`apply_session_usage_delta` drops it rather than merging it.
+
+    :param value: A flat or ``by_model`` sub-key increment from a delta.
+    :returns: ``True`` when *value* is a finite, non-negative, non-bool
+        number; ``False`` otherwise.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(value) and value >= 0
+
+
 def apply_session_usage_delta(current: dict[str, Any], delta: dict[str, Any]) -> None:
     """
     Apply a usage *delta* to *current* in place (add semantics, nested-aware).
@@ -230,6 +324,11 @@ def apply_session_usage_delta(current: dict[str, Any], delta: dict[str, Any]) ->
     model id, summing each model's sub-keys independently. Used by
     :meth:`ConversationStore.increment_session_usage` implementations to
     keep the merge logic in one place.
+
+    Negative and non-finite increments are dropped (see
+    :func:`_is_addable_usage_increment`): they can only come from a forged
+    runner usage frame and would corrupt the cumulative totals the relay
+    cost-budget gate enforces on.
 
     :param current: Existing ``session_usage`` dict (mutated in place).
     :param delta: Increments to apply (same layout as ``session_usage``).
@@ -240,8 +339,10 @@ def apply_session_usage_delta(current: dict[str, Any], delta: dict[str, Any]) ->
             for model_id, model_delta in value.items():
                 bucket = by_model.setdefault(model_id, {})
                 for sub_key, sub_value in model_delta.items():
+                    if not _is_addable_usage_increment(sub_value):
+                        continue
                     bucket[sub_key] = bucket.get(sub_key, 0) + sub_value
-        else:
+        elif _is_addable_usage_increment(value):
             current[key] = current.get(key, 0) + value
 
 
@@ -283,6 +384,7 @@ class ConversationStore(ABC):
         git_branch: str | None = None,
         terminal_launch_args: list[str] | None = None,
         conversation_id: str | None = None,
+        project_id: str | None = None,
     ) -> Conversation:
         """
         Create a new conversation. Generates a unique
@@ -554,6 +656,8 @@ class ConversationStore(ABC):
         owned_by: str | None = None,
         include_archived: bool = False,
         project: str | None = None,
+        pinned: bool = False,
+        pinned_owner: str | None = None,
         title: str | None = None,
     ) -> PagedList[Conversation]:
         """
@@ -644,12 +748,22 @@ class ConversationStore(ABC):
             conversations are excluded. When ``True``, archived and
             non-archived conversations are both returned (the caller
             groups them). Powers the sidebar's "Show archived" toggle.
-        :param project: When set to a non-empty string, only return
-            sessions that have a ``conversation_labels`` row with
-            ``key="omni_project"`` and ``value=project`` (the sidebar's
-            per-project folder fetch). When set to an empty string
-            ``""``, only return sessions with NO project label (unfiled
-            sessions). ``None`` disables the filter.
+        :param project: Filter by project NAME, dual-reading the
+            first-class projects entity and the legacy ``omni_project``
+            label (the sidebar's per-project folder fetch). A non-empty
+            string returns sessions that EITHER have a first-class
+            membership (``metadata.project_id`` → ``owned_by``'s project of
+            this name) OR carry the ``omni_project`` label with this value.
+            ``""`` returns sessions with NEITHER (unfiled). ``None`` disables
+            the filter. The name→id resolution is owner-scoped (projects are
+            owner-private), so pass ``owned_by`` alongside a specific name.
+            See ``designs/PROJECTS_PRD.md``.
+        :param pinned: When ``True``, only return sessions ``pinned_owner`` has
+            pinned (their per-user ``omnigent.pinned.<user>`` label — the
+            sidebar's Pinned section). ``False`` (default) disables the filter.
+        :param pinned_owner: The user whose pins ``pinned=True`` filters to
+            (their per-user key). ``None`` → the single-user ``local`` sentinel.
+            Ignored unless ``pinned`` is ``True``.
         :param title: When set, only return conversations whose
             ``title`` matches exactly. ``None`` disables the filter.
             Powers the ``(agent, title)`` child-session lookup in
@@ -695,17 +809,25 @@ class ConversationStore(ABC):
         _unset_model_override: bool = False,
         cost_control_mode_override: str | None = None,
         _unset_cost_control_mode_override: bool = False,
+        subagent_routing_override: str | None = None,
+        _unset_subagent_routing_override: bool = False,
         harness_override: str | None = None,
+        _unset_harness_override: bool = False,
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
+        reported_model: str | None = None,
     ) -> Conversation | None:
         """
         Update mutable fields on a conversation.
 
-        For ``reasoning_effort``, ``model_override``, and
-        ``cost_control_mode_override``, ``None`` means "leave
-        unchanged". To explicitly clear them back to ``None``, pass
-        the matching ``_unset_*`` flag.
+        For ``reasoning_effort``, ``model_override``,
+        ``cost_control_mode_override``, ``subagent_routing_override``,
+        and ``harness_override``,
+        ``None`` means "leave unchanged". To explicitly clear them
+        back to ``None``, pass
+        the matching ``_unset_*`` flag. ``reported_model`` (the model
+        the harness last reported, verbatim) has no ``_unset`` variant:
+        reports only ever move forward.
 
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
@@ -726,6 +848,12 @@ class ConversationStore(ABC):
         :param _unset_cost_control_mode_override: When ``True``, set
             ``cost_control_mode_override`` to ``None`` regardless of
             the ``cost_control_mode_override`` param value.
+        :param subagent_routing_override: Per-session subagent-routing
+            switch, ``"on"`` or ``"off"``. ``None`` leaves unchanged.
+        :param _unset_subagent_routing_override: When ``True``, set
+            ``subagent_routing_override`` to ``None`` regardless of the
+            ``subagent_routing_override`` param value. Unset reads as
+            Default (the switch is two-state; nothing is inherited).
         :param harness_override: Per-session brain-harness override,
             e.g. ``"pi"``. ``None`` leaves unchanged. No ``_unset``
             variant — the override is set once at session create and
@@ -742,6 +870,39 @@ class ConversationStore(ABC):
             ``None`` leaves unchanged.
         :returns: The updated :class:`Conversation`, or ``None``
             if the conversation does not exist.
+        """
+        ...
+
+    @abstractmethod
+    def rename_conversation_if_title_matches(
+        self,
+        conversation_id: str,
+        expected_title: str,
+        title: str,
+    ) -> Conversation | None:
+        """Rename a conversation only while its current title matches.
+
+        :param conversation_id: Conversation to update.
+        :param expected_title: Title that must still be stored.
+        :param title: Replacement title.
+        :returns: The updated conversation, or ``None`` when the row is
+            missing or its title changed before this call.
+        """
+        ...
+
+    @abstractmethod
+    def set_task_summary(
+        self,
+        conversation_id: str,
+        task_summary: str,
+    ) -> Conversation | None:
+        """Set a human-readable task summary on a sub-agent conversation.
+
+        :param conversation_id: Conversation to update.
+        :param task_summary: Short task-derived label, e.g.
+            ``"Investigate auth token refresh"``.
+        :returns: The updated conversation, or ``None`` when the row
+            does not exist.
         """
         ...
 
@@ -886,6 +1047,26 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def set_conversation_project(
+        self,
+        conversation_id: str,
+        project_id: str | None,
+    ) -> bool:
+        """
+        File a conversation into a first-class project (or unfile it).
+
+        Sets ``omnigent_conversation_metadata.project_id``; ``None`` unfiles
+        the session. The first-class counterpart to moving a session between
+        ``omni_project`` labels (see ``designs/PROJECTS_PRD.md``).
+
+        :param conversation_id: The conversation to update, e.g. ``"conv_abc"``.
+        :param project_id: The project id to file under, or ``None`` to unfile.
+        :returns: ``True`` if a metadata row was updated; ``False`` if the
+            conversation has no metadata row.
+        """
+        ...
+
+    @abstractmethod
     def increment_session_usage(
         self,
         conversation_id: str,
@@ -956,6 +1137,39 @@ class ConversationStore(ABC):
             ``"YYYY-MM-DD"``, e.g. ``"2026-06-05"``.
         :returns: The accumulated ``cost_usd`` for that
             ``(user_id, day_utc)``, or ``0.0`` when no row exists.
+        """
+        ...
+
+    @abstractmethod
+    def sum_daily_cost(self, user_id: str, since_day_utc: str) -> float:
+        """
+        Sum a user's LLM spend over all UTC days ``>= since_day_utc``.
+
+        Backs the ``omni usage`` rolling-window summary: the daily rollup
+        is time-attributed per calendar day, so summing the days in a
+        window gives spend that actually happened in that window (a
+        weeks-old session touched today no longer dumps its whole cost
+        into "today"). Day strings sort lexicographically because they are
+        zero-padded ``"YYYY-MM-DD"``, so the ``>=`` range works as a plain
+        string comparison.
+
+        :param user_id: The user to read, e.g. ``"alice@example.com"``.
+        :param since_day_utc: Inclusive lower-bound UTC day as an ISO date
+            string ``"YYYY-MM-DD"``, e.g. ``"2026-06-05"``.
+        :returns: The summed ``cost_usd`` across matching days, or ``0.0``
+            when no rows fall in the range.
+        """
+        ...
+
+    @abstractmethod
+    def list_daily_costs(self, user_id: str, since_day_utc: str) -> list[tuple[str, float]]:
+        """
+        Return per-day cost rows for a user from ``since_day_utc`` onward.
+
+        :param user_id: The user to read, e.g. ``"alice@example.com"``.
+        :param since_day_utc: Inclusive lower-bound UTC day as ``"YYYY-MM-DD"``.
+        :returns: List of ``(day_utc, cost_usd)`` tuples, ascending by day.
+            Days with no spend are omitted.
         """
         ...
 
@@ -1104,6 +1318,10 @@ class ConversationStore(ABC):
         method; internal sub-agent code also uses it to keep child
         conversations on the parent's current runner.
 
+        Runner/host binding is live state, not conversation activity, so
+        this must NOT bump ``updated_at`` (it drives sidebar ordering
+        and the unread dot).
+
         :param conversation_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
         :param runner_id: Runner identifier to bind to,
@@ -1123,6 +1341,10 @@ class ConversationStore(ABC):
         Counterpart to :meth:`replace_runner_id` for the 1:1
         session↔runner invariant — /clear and /switch unbind the old
         session before binding the runner to the new one.
+
+        Runner/host binding is live state, not conversation activity, so
+        this must NOT bump ``updated_at`` (it drives sidebar ordering
+        and the unread dot).
 
         :param conversation_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
@@ -1151,6 +1373,10 @@ class ConversationStore(ABC):
         ``workspace`` together never violates
         ``ck_conversations_workspace_required_for_host`` (workspace
         is only required while ``host_id`` is set).
+
+        Runner/host binding is live state, not conversation activity, so
+        this must NOT bump ``updated_at`` (it drives sidebar ordering
+        and the unread dot).
 
         :param conversation_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
@@ -1197,6 +1423,10 @@ class ConversationStore(ABC):
         Used when the server asks a host to spawn a runner for
         an existing session. Last-write-wins semantics (like
         :meth:`replace_runner_id`).
+
+        Runner/host binding is live state, not conversation activity, so
+        this must NOT bump ``updated_at`` (it drives sidebar ordering
+        and the unread dot).
 
         :param conversation_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
@@ -1270,6 +1500,7 @@ class ConversationStore(ABC):
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
+        project_id: str | None = None,
     ) -> CreatedSession:
         """
         Atomically create a session and its session-scoped agent.
@@ -1328,10 +1559,19 @@ class ConversationStore(ABC):
         cloned_agent_description: str | None = None,
         copy_model_settings: bool = True,
         copy_terminal_launch_args: bool = True,
+        override_model_override: str | None = None,
+        override_model_override_set: bool = False,
+        override_reasoning_effort: str | None = None,
+        override_reasoning_effort_set: bool = False,
+        override_terminal_launch_args: list[str] | None = None,
+        override_terminal_launch_args_set: bool = False,
+        dropped_label_keys: frozenset[str] = frozenset(),
+        extra_labels: dict[str, str] | None = None,
         carry_history_into_native: bool = False,
         resume_source_native_session: bool = True,
         presentation_labels: dict[str, str] | None = None,
         up_to_response_id: str | None = None,
+        project_id: str | None = None,
     ) -> Conversation:
         """
         Deep-copy a conversation and its items into a new conversation.
@@ -1376,6 +1616,30 @@ class ConversationStore(ABC):
             with none — used when the fork switches to a different CLI, where
             the source's flags are meaningless or rejected (e.g. Claude Code's
             ``--permission-mode`` would make ``pi`` exit at launch).
+        :param override_model_override: Explicit ``model_override`` for the
+            fork, applied only when ``override_model_override_set`` — then it
+            supersedes the ``copy_model_settings`` copy.
+        :param override_model_override_set: Whether the caller chose an
+            explicit ``model_override`` (fork dialog's model picker).
+        :param override_reasoning_effort: Explicit ``reasoning_effort`` for
+            the fork, applied only when ``override_reasoning_effort_set``.
+        :param override_reasoning_effort_set: Whether the caller chose an
+            explicit ``reasoning_effort``.
+        :param override_terminal_launch_args: Explicit
+            ``terminal_launch_args`` for the fork (the permission-mode
+            selector), applied only when ``override_terminal_launch_args_set``
+            — then it supersedes the ``copy_terminal_launch_args`` copy.
+        :param override_terminal_launch_args_set: Whether the caller chose
+            explicit launch args.
+        :param dropped_label_keys: Source labels to NOT copy onto the fork,
+            beyond the always-dropped instance-scoped set (e.g. the
+            permission-mode / codex-bypass label keys when the dialog picks
+            explicit launch args, so a stale copied label can't shadow the
+            freshly chosen mode).
+        :param extra_labels: Labels stamped on the fork AFTER copy/drop, so a
+            deliberate opt-in beats the always-drop rule — e.g. the fork
+            dialog re-arming the DANGEROUS ``codex_native.bypass_sandbox``
+            label (the only path that sets it; the source's is always dropped).
         :param carry_history_into_native: When ``True``, stamp
             :data:`FORK_CARRY_HISTORY_LABEL_KEY` on the fork so a native
             target harness rebuilds its transcript (clone the source's
@@ -1406,6 +1670,11 @@ class ConversationStore(ABC):
             transcript; when the response is the source's last one, the
             copy is equivalent to a full fork and the directive is kept.
             ``None`` (default) copies the full history.
+        :param project_id: First-class project to file the fork into
+            (``metadata.project_id``), or ``None`` (default) to leave it
+            unfiled. The caller resolves whether the fork keeps the
+            source's project — projects are owner-private, so the route
+            passes the source's id only when the forker owns it.
         :returns: The newly created :class:`Conversation`.
         :raises LookupError: If no conversation with
             *source_conversation_id* exists.
@@ -1476,6 +1745,35 @@ class ConversationStore(ABC):
         :returns: The updated :class:`Conversation`.
         :raises LookupError: If no conversation with *conversation_id*
             exists.
+        """
+        ...
+
+    @abstractmethod
+    def has_other_live_session_in_workspace(
+        self,
+        *,
+        host_id: str,
+        workspace: str,
+        exclude_conversation_id: str,
+    ) -> bool:
+        """
+        Is another non-archived conversation sitting in this ``(host_id, workspace)``?
+
+        Sessions routinely share one directory: a fork reusing the source's
+        worktree, or several sessions attached to the same existing worktree
+        via the picker. Worktree cleanup must not remove a directory a live
+        session still runs in, so this is the "is it in use?" gate.
+
+        Archived sessions do not count. They run nothing, so removing the
+        directory cannot wedge them, and counting them would mean a worktree
+        shared by two forks is never cleaned up once either is archived.
+
+        :param host_id: Host owning the worktree, e.g. ``"host_a1b2..."``.
+        :param workspace: Absolute worktree path, e.g. ``"/w/feature-login"``.
+        :param exclude_conversation_id: The conversation being deleted or
+            archived — its own row must not count as "another session".
+        :returns: ``True`` when at least one other live conversation
+            references the pair, else ``False``.
         """
         ...
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -280,10 +281,97 @@ def test_increment_session_usage(store: SqlAlchemyConversationStore) -> None:
     assert result2["input_tokens"] == 150
 
 
+def test_apply_session_usage_delta_drops_negative_and_non_finite_increments() -> None:
+    """A forged usage frame can't drive a cumulative counter backwards or poison it.
+
+    ``apply_session_usage_delta`` is the single merge point for the relay
+    ``increment_session_usage`` path, whose totals the cost-budget gate
+    enforces on. Negative and non-finite increments — flat or nested under
+    ``by_model`` — are dropped rather than applied; well-formed non-negative
+    increments still merge.
+    """
+    from omnigent.stores.conversation_store import apply_session_usage_delta
+
+    current: dict[str, Any] = {
+        "input_tokens": 100,
+        "total_cost_usd": 1.0,
+        "by_model": {"m": {"input_tokens": 100, "total_cost_usd": 1.0}},
+    }
+    apply_session_usage_delta(
+        current,
+        {
+            "input_tokens": -1_000_000,
+            "output_tokens": float("nan"),
+            "total_cost_usd": float("-inf"),
+            "by_model": {"m": {"input_tokens": -50, "total_cost_usd": float("inf")}},
+        },
+    )
+    assert current["input_tokens"] == 100
+    assert "output_tokens" not in current
+    assert current["total_cost_usd"] == 1.0
+    assert current["by_model"]["m"] == {"input_tokens": 100, "total_cost_usd": 1.0}
+
+    apply_session_usage_delta(
+        current, {"input_tokens": 25, "by_model": {"m": {"input_tokens": 25}}}
+    )
+    assert current["input_tokens"] == 125
+    assert current["by_model"]["m"]["input_tokens"] == 125
+
+
 def test_set_external_session_id(store: SqlAlchemyConversationStore) -> None:
     conv = store.create_conversation(title="ext")
     updated = store.set_external_session_id(conv.id, "ext-uuid-123")
     assert updated.external_session_id == "ext-uuid-123"
+
+
+# ── project membership ─────────────────────────────────
+
+
+def test_set_conversation_project_lands_in_omnigent_db(
+    omnigent_db: Path, store: SqlAlchemyConversationStore
+) -> None:
+    """``project_id`` is written to the metadata row in the Omnigent DB."""
+    project_id = "b" * 32
+    conv = store.create_conversation(title="filed")
+    filed = store.set_conversation_project(conv.id, project_id)
+    assert filed is True
+
+    stored = _col(omnigent_db, "omnigent_conversation_metadata", "project_id", f"id=X'{conv.id}'")
+    assert stored == [project_id]
+    # Reads back through the entity (which merges both DBs).
+    assert store.get_conversation(conv.id).project_id == project_id
+
+
+def test_list_conversations_project_name_filter_crosses_dbs(
+    store: SqlAlchemyConversationStore,
+    omnigent_db: Path,
+) -> None:
+    """The dual-read ``project`` (by name) filter resolves the first-class
+    member ids from the Omnigent DB (``projects`` JOIN ``conversation_metadata``,
+    both colocated there) and ORs them with the ``omni_project`` label on the AP
+    DB — the cross-DB path a single-DB test can't exercise.
+    """
+    from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+
+    # projects lives on the Omnigent DB, so create it against that URI.
+    project_store = SqlAlchemyProjectStore(f"sqlite:///{omnigent_db}")
+    project = project_store.create("c" * 32, "Work", None)
+
+    first_class = store.create_conversation(title="first-class")
+    labelled = store.create_conversation(title="labelled")
+    unfiled = store.create_conversation(title="loose")
+    store.set_conversation_project(first_class.id, project.id)
+    store.set_labels(labelled.id, {"omni_project": "Work"})
+
+    members = store.list_conversations(project="Work", owned_by=None)
+    assert {c.id for c in members.data} == {first_class.id, labelled.id}
+
+    # Empty string means "unfiled" — the loose session, excluding both members,
+    # even though first-class membership lives in the other physical DB.
+    unfiled_ids = {c.id for c in store.list_conversations(project="", owned_by=None).data}
+    assert unfiled.id in unfiled_ids
+    assert first_class.id not in unfiled_ids
+    assert labelled.id not in unfiled_ids
 
 
 # ── conversation items ─────────────────────────────────
@@ -351,12 +439,10 @@ def test_delete_conversation_subtree_cleans_both_dbs(
     parent = store.create_conversation(title="parent")
     store.create_conversation(kind="sub_agent", title="child", parent_conversation_id=parent.id)
     assert _count(conv_db, "conversations") == 2
-    assert _count(conv_db, "agent_configuration") == 2
     assert _count(omnigent_db, "omnigent_conversation_metadata") == 2
 
     asyncio.run(store.delete_conversation(parent.id))
     assert _count(conv_db, "conversations") == 0
-    assert _count(conv_db, "agent_configuration") == 0
     assert _count(omnigent_db, "omnigent_conversation_metadata") == 0
 
 
@@ -435,10 +521,10 @@ def test_agent_store_resolves_session_id_across_dbs(
         agent_description=None,
         title="split session",
     )
-    # Agent row lands in the Omnigent DB; the binding in the AP DB's
-    # agent_configuration table.
+    # Agent row lands in the Omnigent DB; the binding on the AP DB's
+    # conversations.agent_id column.
     assert _count(omnigent_db, "agents") == 1
-    assert _col(conv_db, "agent_configuration", "agent_id") == ["112c4ebea353b873df12de9d02f539ab"]
+    assert _col(conv_db, "conversations", "agent_id") == ["112c4ebea353b873df12de9d02f539ab"]
 
     agent_store = SqlAlchemyAgentStore(
         f"sqlite:///{omnigent_db}",
@@ -524,7 +610,7 @@ def test_delete_conversation_deletes_session_scoped_agent(
 
     asyncio.run(store.delete_conversation(created.conversation.id))
     assert _count(omnigent_db, "agents") == 0
-    assert _count(conv_db, "agent_configuration") == 0
+    assert _count(conv_db, "conversations") == 0
 
 
 def test_delete_conversation_keeps_template_agent(
@@ -548,3 +634,52 @@ def test_delete_conversation_keeps_template_agent(
 
     asyncio.run(store.delete_conversation(conv.id))
     assert _col(omnigent_db, "agents", "id") == ["191cbf904e3223e9e00ac9a1abfe79a5"]
+
+
+# ── Connection-checkout budget ─────────────────────────
+
+
+def test_get_conversation_takes_one_checkout_per_engine(
+    store: SqlAlchemyConversationStore,
+) -> None:
+    """Split-DB keeps two checkouts — one per engine — and still reads metadata.
+
+    The single-DB collapse comes from ``shared_read_scope``, which keys its
+    shared session by engine. Here the metadata table genuinely lives on another
+    engine, so its checkout cannot be shared away; what must not regress is the
+    routing (metadata still read from the Omnigent DB) or the per-engine budget.
+    """
+    from sqlalchemy import event
+
+    created = store.create_conversation(
+        title="split-budget",
+        runner_id="runner_split",
+        host_id="a6bfc420101272fcd5906a9eff904dfd",
+        workspace="/tmp/ws",
+    )
+
+    per_engine: dict[str, int] = {"conv": 0, "omnigent": 0}
+
+    def _mk(tag: str) -> Any:
+        def _on_checkout(_dbapi: object, _record: object, _proxy: object) -> None:
+            per_engine[tag] += 1
+
+        return _on_checkout
+
+    conv_hook, omni_hook = _mk("conv"), _mk("omnigent")
+    assert store._conv_engine is not store._engine, "fixture must be split-DB"
+    event.listen(store._conv_engine, "checkout", conv_hook)
+    event.listen(store._engine, "checkout", omni_hook)
+    try:
+        conv = store.get_conversation(created.id)
+    finally:
+        event.remove(store._conv_engine, "checkout", conv_hook)
+        event.remove(store._engine, "checkout", omni_hook)
+
+    assert per_engine == {"conv": 1, "omnigent": 1}, per_engine
+    assert conv is not None
+    assert conv.title == "split-budget"
+    assert (conv.runner_id, conv.host_id) == (
+        "runner_split",
+        "a6bfc420101272fcd5906a9eff904dfd",
+    )

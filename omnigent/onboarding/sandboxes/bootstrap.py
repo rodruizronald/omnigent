@@ -43,6 +43,8 @@ from urllib.parse import parse_qs, urlparse
 import click
 import httpx
 
+from omnigent.cli_invocation import cli_invocation
+
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
@@ -379,7 +381,8 @@ def _workspace_org_id(workspace_host: str) -> str | None:
         response = httpx.get(f"{workspace_host}/login.html", timeout=10.0)
     except httpx.HTTPError:
         return None
-    return response.headers.get("x-databricks-org-id")
+    workspace_id = response.headers.get("x-databricks-org-id")
+    return str(workspace_id) if workspace_id is not None else None
 
 
 def derive_workspace(server_url: str) -> DerivedWorkspace | None:
@@ -496,14 +499,16 @@ def login_app_oauth_in_sandbox(
     # (e.g. Modal) — BEFORE validating flags or touching the sandbox, so
     # the user gets the --no-auth hint instead of a misleading error
     # from a doomed in-sandbox login.
-    if not launcher.supports_local_port_forward:
+    if not launcher.capabilities.local_port_forward:
         raise launcher.forward_capability_error()
     if server_url is None:
         raise click.ClickException(
             "The in-sandbox login needs the server URL — pass --server, or --no-auth to skip."
         )
 
-    click.echo(f"▸ Logging sandbox '{sandbox_id}' in to {server_url}")
+    from omnigent.server_url import display_server_url
+
+    click.echo(f"▸ Logging sandbox '{sandbox_id}' in to {display_server_url(server_url)}")
     if workspace is not None:
         # Reset ~/.databrickscfg to exactly one [DEFAULT] entry shaped
         # like what `databricks auth login` itself writes (host +
@@ -566,7 +571,7 @@ def _complete_browser_login(
         returncode = login.wait()
         if returncode != 0:
             raise click.ClickException(
-                f"`omnigent login` inside sandbox '{sandbox_id}' exited "
+                f"`{cli_invocation()} login` inside sandbox '{sandbox_id}' exited "
                 f"with code {returncode} before printing a verification "
                 "URL. Run it inside the sandbox manually to debug."
             )
@@ -587,7 +592,8 @@ def _complete_browser_login(
         returncode = login.wait()
         if returncode != 0:
             raise click.ClickException(
-                f"`omnigent login` inside sandbox '{sandbox_id}' exited with code {returncode}."
+                f"`{cli_invocation()} login` inside sandbox '{sandbox_id}' "
+                f"exited with code {returncode}."
             )
 
 
@@ -668,18 +674,50 @@ def connect_sandbox_host(
         config.yaml (usually ``socket.gethostname()``).
     :raises click.ClickException: If the remote command exits non-zero.
     """
-    click.echo(f"▸ Registering sandbox '{sandbox_id}' as a host with {server_url}")
+    from omnigent.server_url import display_server_url
+
+    click.echo(
+        f"▸ Registering sandbox '{sandbox_id}' as a host with {display_server_url(server_url)}"
+    )
+    # The executed command keeps the wire URL — it must work verbatim in-sandbox.
     if host_name is not None:
         set_sandbox_host_name(launcher, sandbox_id, host_name)
-    click.echo("  → running `omnigent host` in the sandbox (Ctrl-C to detach)")
+    click.echo(f"  → running `{cli_invocation()} host` in the sandbox (Ctrl-C to detach)")
     returncode = launcher.exec_foreground(sandbox_id, f"omnigent host --server {server_url}")
     if returncode != 0:
         raise click.ClickException(
-            f"`omnigent host` on sandbox '{sandbox_id}' exited with code {returncode}."
+            f"`{cli_invocation()} host` on sandbox '{sandbox_id}' exited with code {returncode}."
         )
 
 
 # ── High-level orchestrator ────────────────────────────
+
+
+def _terminate_failed_bootstrap(launcher: SandboxLauncher, sandbox_id: str) -> None:
+    """
+    Best-effort terminate of a sandbox the failing bootstrap created.
+
+    A sandbox provisioned by a run that then fails (wheel build, ship,
+    install, auth) is half-set-up and, with the keep-alive already
+    applied, would otherwise keep billing until its lifetime lapses.
+    Only bootstrap-created sandboxes are terminated — attached
+    pre-existing ones are the user's to keep — and a termination error
+    is reported without masking the original failure.
+
+    :param launcher: The provider's launcher.
+    :param sandbox_id: The sandbox this run provisioned.
+    """
+    click.echo(f"▸ Bootstrap failed — terminating sandbox '{sandbox_id}' created by this run")
+    try:
+        launcher.terminate(sandbox_id)
+    except Exception as exc:
+        click.echo(
+            f"  → warning: could not terminate '{sandbox_id}' ({exc}); "
+            "terminate it manually with the provider's tooling.",
+            err=True,
+        )
+    else:
+        click.echo(f"  → terminated {sandbox_id}")
 
 
 def bootstrap_sandbox_host(
@@ -698,6 +736,11 @@ def bootstrap_sandbox_host(
     Six steps: provider preflight → provision or attach sandbox →
     keep-alive → build wheels → ship wheels → ``omnigent login``
     inside the sandbox.
+
+    A failure (or Ctrl-C) after provisioning terminates the
+    just-created sandbox, best-effort, so an unfinished bootstrap
+    doesn't leak a running, keep-alive-extended session. Sandboxes
+    passed in via *sandbox_id* are never terminated.
 
     :param launcher: The provider's launcher.
     :param sandbox_id: Existing sandbox id to attach to, or ``None`` to
@@ -722,27 +765,35 @@ def bootstrap_sandbox_host(
     # up front so a misconfigured call fails before the wheel build and
     # ship already ran. (The CLI skips auth automatically for providers
     # without the capability; this backstops programmatic callers.)
-    if not skip_auth and not launcher.supports_local_port_forward:
+    if not skip_auth and not launcher.capabilities.local_port_forward:
         raise launcher.forward_capability_error()
     launcher.prepare()
+    provisioned = sandbox_id is None
     if sandbox_id is None:
         sandbox_id = launcher.provision(sandbox_name)
     else:
         launcher.attach(sandbox_id)
     click.echo(f"  → sandbox_id={sandbox_id}")
-    launcher.keep_alive(sandbox_id)
-    wheels_tgz = Path(DEFAULT_WHEELS_TGZ)
-    build_wheels(
-        repo_root,
-        tgz_path=wheels_tgz,
-        pypi_proxy=launcher.wheel_build_index_url,
-    )
-    ship_wheels(launcher, sandbox_id, wheels_tgz=wheels_tgz)
-    login_app_oauth_in_sandbox(
-        launcher,
-        sandbox_id,
-        server_url=server_url,
-        workspace=workspace,
-        skip=skip_auth,
-    )
+    # BaseException: a Ctrl-C mid-bootstrap abandons the sandbox just as
+    # thoroughly as an error does — clean up our own creation either way.
+    try:
+        launcher.keep_alive(sandbox_id)
+        wheels_tgz = Path(DEFAULT_WHEELS_TGZ)
+        build_wheels(
+            repo_root,
+            tgz_path=wheels_tgz,
+            pypi_proxy=launcher.wheel_build_index_url,
+        )
+        ship_wheels(launcher, sandbox_id, wheels_tgz=wheels_tgz)
+        login_app_oauth_in_sandbox(
+            launcher,
+            sandbox_id,
+            server_url=server_url,
+            workspace=workspace,
+            skip=skip_auth,
+        )
+    except BaseException:
+        if provisioned:
+            _terminate_failed_bootstrap(launcher, sandbox_id)
+        raise
     return sandbox_id

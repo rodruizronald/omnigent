@@ -13,6 +13,8 @@ from urllib.parse import urlparse
 
 from playwright.sync_api import Page, Route, expect
 
+from tests.e2e_ui.conftest import fetch_with_retry
+
 # Launch-resolved default the runner booted opencode with.
 LAUNCH_MODEL = "openrouter/nemotron"
 # The model the user switched to inside the opencode TUI; the forwarder mirrored
@@ -48,7 +50,7 @@ def _patch_session_as_opencode_native(page: Page, session_id: str) -> list[dict]
 
         headers = {"content-type": "application/json"}
         if request.method == "GET":
-            response = route.fetch()
+            response = fetch_with_retry(route)
             payload = response.json()
             headers = {**response.headers, **headers}
         elif request.method == "PATCH":
@@ -103,26 +105,27 @@ def test_opencode_native_model_command_opens_picker_and_persists_pick(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    trigger = page.get_by_test_id("agent-picker-trigger")
-    expect(trigger).to_be_visible(timeout=15_000)
+    gear = page.get_by_test_id("composer-config-gear")
+    expect(gear).to_be_visible(timeout=15_000)
 
-    # opencode is identified as its own native wrapper in the status tray.
-    expect(page.get_by_test_id("composer-harness")).to_contain_text("OpenCode")
+    # opencode is identified as its own native wrapper in the config tooltip.
+    gear.hover()
+    expect(page.get_by_test_id("composer-config-gear-tooltip")).to_contain_text("OpenCode")
 
-    # Bare /model opens the existing picker with the session-scoped catalog.
-    composer = page.get_by_placeholder("Ask the agent anything…")
+    # Bare /model opens the config modal with the session-scoped catalog.
+    composer = page.get_by_placeholder("Send a message…")
     composer.fill("/model ")
     composer.press("Enter")
+    expect(page.get_by_test_id("composer-config-modal")).to_be_visible()
+    page.get_by_test_id("composer-config-model").click()
 
-    current_row = page.locator(
-        f'[data-testid="model-picker-item"][data-model-id="{LIVE_TUI_MODEL}"]'
-    )
-    alternate_row = page.locator(
-        f'[data-testid="model-picker-item"][data-model-id="{ALTERNATE_MODEL}"]'
-    )
+    current_row = page.locator(f'[role="option"][data-model-id="{LIVE_TUI_MODEL}"]')
+    alternate_row = page.locator(f'[role="option"][data-model-id="{ALTERNATE_MODEL}"]')
     expect(current_row).to_be_visible()
     expect(alternate_row).to_be_visible()
 
+    # Selecting only drafts the pick; the PATCH fires on Save.
+    alternate_row.click()
     with page.expect_response(
         lambda response: (
             response.request.method == "PATCH"
@@ -130,7 +133,7 @@ def test_opencode_native_model_command_opens_picker_and_persists_pick(
             and response.status == 200
         )
     ):
-        alternate_row.click()
+        page.get_by_test_id("composer-config-save").click()
 
     assert patch_bodies[-1] == {"model_override": ALTERNATE_MODEL}
-    expect(trigger).to_contain_text(ALTERNATE_MODEL)
+    expect(page.get_by_test_id("composer-model-effort-label")).to_contain_text(ALTERNATE_MODEL)

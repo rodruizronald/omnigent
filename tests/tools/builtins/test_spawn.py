@@ -76,6 +76,16 @@ def test_file_ids_description_mentions_fresh_named_spawn_only() -> None:
     assert "continuing an existing named session" in file_ids_description
 
 
+def test_parallel_description_requires_distinct_titles() -> None:
+    schema = _schema_with_subagent()
+    description = schema["function"]["description"]
+    title_description = schema["function"]["parameters"]["properties"]["title"]["description"]
+
+    assert "distinct task-based title" in description
+    assert "auto-assigned" in title_description
+    assert "structured name" in title_description
+
+
 # ── Happy paths ───────────────────────────────────────
 
 
